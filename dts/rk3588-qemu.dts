@@ -1,0 +1,294 @@
+/*
+ * Minimal device tree for the QEMU rk3588 machine model (P5).
+ *
+ * Only devices the model implements: GICv3 (fe600000/fe680000), the
+ * DW-APB UART2 console (feb50000, level IRQ on its real GIC SPI 333),
+ * the arch timer (24 MHz PPIs, virt-style level-low), and one CPU (SMP
+ * bring-up is deferred — TF-A's rk3588 PSCI pokes unmodelled PMU regs).
+ * Memory covers the below-4G RAM window; u-boot's booti fixup rewrites
+ * it anyway (its bi_dram has the exact bank layout).
+ *
+ * 4-cell GIC syntax of upstream rk3588 dtsi is not used: QEMU's gicv3
+ * model follows the virt wiring, so interrupts use the 3-cell form and
+ * timer PPIs are level-low like virt's generated FDT.
+ */
+/dts-v1/;
+
+/ {
+	model = "QEMU rk3588 model";
+	compatible = "qemu,rk3588", "rockchip,rk3588";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&gic>;
+
+	aliases {
+		serial0 = &uart2;
+	};
+
+	chosen {
+		stdout-path = "serial0:1500000n8";
+		bootargs = "earlycon console=ttyS0,1500000 nokaslr";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0xf0000000>;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a76";
+			reg = <0>;
+			enable-method = "psci";
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer", "arm,armv7-timer";
+		interrupts = <1 13 4>,   /* sec-phys  PPI 13 */
+		             <1 14 4>,   /* phys      PPI 14 */
+		             <1 11 4>,  /* virt      PPI 11 */
+		             <1 10 4>;  /* hyp-phys  PPI 10 */
+		always-on;
+	};
+
+	gic: interrupt-controller@fe600000 {
+		compatible = "arm,gic-v3";
+		#interrupt-cells = <3>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		interrupt-controller;
+		reg = <0x0 0xfe600000 0x0 0x10000>,   /* GICD */
+		      <0x0 0xfe680000 0x0 0x100000>;  /* GICR */
+	};
+
+	/*
+	 * 24 MHz reference.  clock-output-names MUST be "xin24m": the
+	 * clk-rk3588 driver looks the PLL parent up BY NAME (PNAME
+	 * mux_pll_p = { "xin24m", "xin32k" }) — without it every PLL
+	 * recalc gets an orphan 0 MHz parent.
+	 */
+	xin24m: clock-24m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-output-names = "xin24m";
+		clock-frequency = <24000000>;
+	};
+
+	/*
+	 * Real CRU clock + reset controller (fd7c0000 window, 0x5c000 per
+	 * rk3588-base.dtsi, covering the PHP/PMU/BIGCORE/DSU sub-CRUs).
+	 * The model is register storage with PLL lock bits; all rate math
+	 * lives in the kernel's clk-rk3588 driver.
+	 */
+	cru: clock-controller@fd7c0000 {
+		compatible = "rockchip,rk3588-cru";
+		reg = <0x0 0xfd7c0000 0x0 0x5c000>;
+		#clock-cells = <1>;
+		#reset-cells = <1>;
+	};
+
+	uart2: serial@feb50000 {
+		compatible = "snps,dw-apb-uart";
+		reg = <0x0 0xfeb50000 0x0 0x100>;
+		reg-shift = <2>;
+		reg-io-width = <4>;
+		/* GIC_SPI(0) 333 level-high, as rk3588-base.dtsi */
+		interrupts = <0 333 4>;
+		clocks = <&xin24m>, <&xin24m>;
+		clock-names = "baudclk", "apb_pclk";
+		status = "okay";
+	};
+
+	/*
+	 * eMMC (sdhci@fe2e0000, "rockchip,rk3588-dwcmshc"): image attaches
+	 * via -drive if=sd unit 1 (unit 0 is the SD slot).  Clock/reset ids
+	 * from include/dt-bindings/{clock,reset}/rockchip,rk3588-cru.h:
+	 * CCLK/HCLK/ACLK/BCLK/TMCLK_EMMC = 300/298/299/301/302,
+	 * SRST_C/H/A/B/T_EMMC = 280/278/279/281/282.  supports-cqe omitted
+	 * (no CQE model); pinctrl omitted (no pin controller in the model).
+	 */
+	sdhci: mmc@fe2e0000 {
+		compatible = "rockchip,rk3588-dwcmshc";
+		reg = <0x0 0xfe2e0000 0x0 0x10000>;
+		interrupts = <0 205 4>;
+		clocks = <&cru 300>, <&cru 298>,
+			 <&cru 299>, <&cru 301>, <&cru 302>;
+		clock-names = "core", "bus", "axi", "block", "timer";
+		resets = <&cru 280>, <&cru 278>,
+			 <&cru 279>, <&cru 281>, <&cru 282>;
+		reset-names = "core", "bus", "axi", "block", "timer";
+		bus-width = <8>;
+		max-frequency = <200000000>;
+		non-removable;
+		status = "okay";
+	};
+
+	/*
+	 * SD slot (dw-mshc@fe2c0000).  biu/ciu stay fixed clocks (the stock
+	 * tree sources them from SCMI firmware clocks; no SCMI model yet),
+	 * ciu-drive/ciu-sample omitted (driver treats them as optional).
+	 */
+	sdmmc: mmc@fe2c0000 {
+		compatible = "rockchip,rk3588-dw-mshc", "rockchip,rk3288-dw-mshc";
+		reg = <0x0 0xfe2c0000 0x0 0x4000>;
+		interrupts = <0 203 4>;
+		clocks = <&xin24m>, <&xin24m>;
+		clock-names = "biu", "ciu";
+		fifo-depth = <0x100>;
+		max-frequency = <200000000>;
+		status = "okay";
+	};
+
+	/*
+	 * P6 HDMI: the display pipeline of rk3588-base.dtsi (VOP2 -> dw
+	 * HDMI QP -> connector), on the model's register-file syscons and
+	 * real CRU clocks (ACLK/HCLK/DCLK_VOP0-3 = 605/604/609-612; HDMI
+	 * PCLK/EARC/REF/AUD/HDP/HCLK_VO1 = 528/529/530/564/594/717; PHY
+	 * REF/APB = 672/596; resets SRST_HDMITX0_REF=462, SRST_HDMIHDP0=560,
+	 * SRST_HDPTX0{,_P,_INIT,_CMN,_LANE,_ROPLL,_LCPLL} =
+	 * 547/538/611/612/613/545/546).  Raw cells: GIC_SPI=0,
+	 * IRQ_TYPE_LEVEL_HIGH=4, ROCKCHIP_VOP2_EP_HDMI0=2
+	 * (dt-bindings/soc/rockchip,vop2.h).
+	 */
+	sys_grf: syscon@fd58c000 {
+		compatible = "rockchip,rk3588-sys-grf", "syscon";
+		reg = <0x0 0xfd58c000 0x0 0x1000>;
+	};
+
+	vop_grf: syscon@fd5a4000 {
+		compatible = "syscon";
+		reg = <0x0 0xfd5a4000 0x0 0x2000>;
+	};
+
+	vo1_grf: syscon@fd5a8000 {
+		compatible = "syscon";
+		reg = <0x0 0xfd5a8000 0x0 0x4000>;
+	};
+
+	pmu_syscon: syscon@fd8d0000 {
+		compatible = "syscon";
+		reg = <0x0 0xfd8d0000 0x0 0x400>;
+	};
+
+	hdptxphy0_grf: syscon@fd5e0000 {
+		compatible = "syscon";
+		reg = <0x0 0xfd5e0000 0x0 0x100>;
+	};
+
+	display-subsystem {
+		compatible = "rockchip,display-subsystem";
+		ports = <&vop_out>;
+	};
+
+	vop: vop@fdd90000 {
+		compatible = "rockchip,rk3588-vop";
+		reg = <0x0 0xfdd90000 0x0 0x4200>,
+		      <0x0 0xfdd95000 0x0 0x1000>;
+		reg-names = "vop", "gamma-lut";
+		interrupts = <0 156 4>;
+		clocks = <&cru 605>, <&cru 604>,
+			 <&cru 609>, <&cru 610>, <&cru 611>, <&cru 612>;
+		clock-names = "aclk", "hclk",
+			      "dclk_vp0", "dclk_vp1", "dclk_vp2", "dclk_vp3";
+		rockchip,grf = <&sys_grf>;
+		rockchip,vop-grf = <&vop_grf>;
+		rockchip,vo1-grf = <&vo1_grf>;
+		rockchip,pmu = <&pmu_syscon>;
+		status = "okay";
+
+		vop_out: ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				vp0_out_hdmi0: endpoint@2 {
+					reg = <2>;
+					remote-endpoint = <&hdmi0_in_vp0>;
+				};
+			};
+		};
+	};
+
+	hdmi0: hdmi@fde80000 {
+		compatible = "rockchip,rk3588-dw-hdmi-qp";
+		reg = <0x0 0xfde80000 0x0 0x20000>;
+		interrupts = <0 169 4>,
+			     <0 170 4>,
+			     <0 171 4>,
+			     <0 172 4>,
+			     <0 360 4>;
+		interrupt-names = "avp", "cec", "earc", "main", "hpd";
+		clocks = <&cru 528>, <&cru 529>, <&cru 530>,
+			 <&cru 564>, <&cru 594>, <&cru 717>;
+		clock-names = "pclk", "earc", "ref", "aud", "hdp", "hclk_vo1";
+		resets = <&cru 462>, <&cru 560>;
+		reset-names = "ref", "hdp";
+		phys = <&hdptxphy0>;
+		rockchip,grf = <&sys_grf>;
+		rockchip,vo-grf = <&vo1_grf>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				hdmi0_in_vp0: endpoint {
+					remote-endpoint = <&vp0_out_hdmi0>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				hdmi0_out_con: endpoint {
+					remote-endpoint = <&hdmi0_con_in>;
+				};
+			};
+		};
+	};
+
+	hdmi0-con {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi0_con_in: endpoint {
+				remote-endpoint = <&hdmi0_out_con>;
+			};
+		};
+	};
+
+	hdptxphy0: phy@fed60000 {
+		compatible = "rockchip,rk3588-hdptx-phy";
+		reg = <0x0 0xfed60000 0x0 0x2000>;
+		#clock-cells = <0>;
+		#phy-cells = <0>;
+		clocks = <&cru 672>, <&cru 596>;
+		clock-names = "ref", "apb";
+		resets = <&cru 547>, <&cru 538>, <&cru 611>,
+			 <&cru 612>, <&cru 613>, <&cru 545>, <&cru 546>;
+		reset-names = "phy", "apb", "init", "cmn", "lane",
+			      "ropll", "lcpll";
+		rockchip,grf = <&hdptxphy0_grf>;
+		status = "okay";
+	};
+};

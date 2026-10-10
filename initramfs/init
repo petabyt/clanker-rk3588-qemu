@@ -1,0 +1,16 @@
+#!/bin/busybox sh
+# P5 initramfs init: mounts, run the demo battery, then idle on a shell
+# (shell input needs the UART IRQ wiring — a P5 follow-up milestone).
+
+/bin/busybox --install -s /bin 2>/dev/null
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev 2>/dev/null || mdev -s
+
+echo
+echo "P5 initramfs: starting demo..."
+/bin/demo
+echo "P5 initramfs: demo exited, spawning shell (idle)"
+
+exec /bin/sh

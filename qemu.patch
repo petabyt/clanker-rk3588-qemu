@@ -1,0 +1,31 @@
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 4445f16..6a52e23 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -155,6 +155,14 @@ config REALVIEW
+     select DS1338 # I2C RTC+NVRAM
+     select USB_OHCI_SYSBUS
+ 
++config RK3588
++    bool
++    default y
++    depends on TCG && AARCH64
++    select DEVICE_TREE
++    select ARM_GIC
++    select UNIMP
++
+ config SBSA_REF
+     bool
+     default y
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index bcc068d..99a370f 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -12,6 +12,7 @@ arm_common_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx.c', 'npcm7xx_b
+ arm_common_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm8xx.c', 'npcm8xx_boards.c'))
+ arm_common_ss.add(when: 'CONFIG_REALVIEW', if_true: files('realview.c'))
+ arm_common_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa-ref.c'))
++arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-sdhci.c'))
+ arm_common_ss.add(when: 'CONFIG_STELLARIS', if_true: files('stellaris.c'))
+ arm_common_ss.add(when: 'CONFIG_STM32VLDISCOVERY', if_true: files('stm32vldiscovery.c'))
+ arm_common_ss.add(when: 'CONFIG_ZYNQ', if_true: files('xilinx_zynq.c'))

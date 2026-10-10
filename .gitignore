@@ -1,0 +1,39 @@
+# QEMU build directory (1.7 GB, output of `make qemu`)
+/build/
+
+# AppImage packaging output + extraction
+/squashfs-root/
+*.AppImage
+
+# Images regenerable from sources (make linux-dtb / linux-initramfs /
+# scripts/mk-emmc-img.py): kernel DTB, initramfs.bin, eMMC test image,
+# scratch SD images
+/images/
+
+# initramfs build outputs (initramfs/build.sh); keep demo.c/init/build.sh
+/initramfs/rootfs/
+/initramfs/initramfs.cpio.gz
+/initramfs/initramfs.cpio.list
+
+# Third-party source trees: separate checkouts/downloads.
+# Deltas live outside the tree: qemu.patch + the src symlink for ./qemu,
+# plan.md build notes for u-boot/atf/linux, rk's own git repo for ./rk.
+/qemu/
+/u-boot/
+/linux/
+/atf/
+/rk/
+/arm-docs/
+
+# Session scratch
+/tmp-backup/
+*.tmp
+__pycache__/
+
+rk3588_ddr_lp4_2112MHz_lp5_2400MHz_v1.16.bin
+rk3588_ddr_lp4_2112MHz_lp5_2400MHz_v1.16.bin.c
+
+/logs/
+logs.txt
+/edk2/
+/board-runs/

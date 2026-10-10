@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RK3588 QEMU
+GenericName=System Emulator
+Comment=Portable qemu-system-aarch64 for the Rockchip RK3588 (Orange Pi 5 / Cool-Pi Genbook)
+Exec=qemu-system-aarch64
+Icon=rk3588-qemu
+Terminal=true
+Categories=System;Emulator;
+Keywords=qemu;rk3588;aarch64;arm;emulator;
