@@ -205,22 +205,42 @@ int main(void)
 
 	/* P11 eMMC tests: card probe, block reads, partition scan, ext4. */
 	{
-		int mmc, tries, f;
+		int mmc = -1, tries, i, f;
 		unsigned char mbr[512];
 		char hello[128];
+		char bdev[32], pdev[32];
 
-		/* the mmc core probes asynchronously: poll up to ~15 s */
-		mmc = -1;
-		for (tries = 0; tries < 150; tries++) {
-			mmc = open("/dev/mmcblk0", O_RDONLY);
-			if (mmc >= 0) {
+		/* the mmc core probes asynchronously: poll up to ~15 s for
+		 * an eMMC disk (MBR + Linux partition).  The disk index
+		 * depends on how many mmc hosts enumerate before it, so
+		 * scan the /dev/mmcblkN names. */
+		for (tries = 0; tries < 150 && mmc < 0; tries++) {
+			for (i = 0; i < 8; i++) {
+				snprintf(bdev, sizeof(bdev), "/dev/mmcblk%d", i);
+				mmc = open(bdev, O_RDONLY);
+				if (mmc < 0) {
+					continue;
+				}
+				if (read(mmc, mbr, 512) != 512) {
+					close(mmc);
+					mmc = -1;
+					continue;
+				}
+				if (mbr[510] != 0x55 || mbr[511] != 0xaa ||
+				    mbr[0x1c2] != 0x83) {
+					close(mmc);
+					mmc = -1;
+					continue;
+				}
 				break;
 			}
-			usleep(100000);
+			if (mmc < 0) {
+				usleep(100000);
+			}
 		}
-		check("open /dev/mmcblk0", mmc >= 0);
+		check("open eMMC disk", mmc >= 0);
 		if (mmc >= 0) {
-			check("read MBR sector", read(mmc, mbr, 512) == 512);
+			printf("       eMMC disk: %s\n", bdev);
 			check("MBR signature 0x55AA",
 			      mbr[510] == 0x55 && mbr[511] == 0xaa);
 			/* partition entry 1 at 0x1be: type byte at +4 = 0x83 */
@@ -228,20 +248,21 @@ int main(void)
 			      mbr[0x1c2] == 0x83);
 			close(mmc);
 		}
+		snprintf(pdev, sizeof(pdev), "%sp1", bdev);
 		mmc = -1;
 		for (tries = 0; tries < 150; tries++) {
-			mmc = open("/dev/mmcblk0p1", O_RDONLY);
+			mmc = open(pdev, O_RDONLY);
 			if (mmc >= 0) {
 				break;
 			}
 			usleep(100000);
 		}
-		check("open /dev/mmcblk0p1 (partition scan)", mmc >= 0);
+		check("open eMMC partition (partition scan)", mmc >= 0);
 		if (mmc >= 0) {
 			close(mmc);
 		}
-		check("mount ext4 /dev/mmcblk0p1 -> /mnt",
-		      mount("/dev/mmcblk0p1", "/mnt", "ext4", 0, NULL) == 0);
+		check("mount ext4 eMMC partition -> /mnt",
+		      mount(pdev, "/mnt", "ext4", 0, NULL) == 0);
 		f = open("/mnt/hello.txt", O_RDONLY);
 		check("open /mnt/hello.txt", f >= 0);
 		if (f >= 0) {

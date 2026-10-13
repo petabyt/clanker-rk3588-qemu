@@ -56,7 +56,7 @@ $(QEMU_BUILD)/config.status: $(QEMU_DIR)/configure $(QEMU_PATCH) \
 		echo "$(QEMU_PATCH): already applied"; \
 	else \
 		echo "ERROR: $(QEMU_PATCH) is out of sync with ./qemu." >&2; \
-		echo "Regenerate it: git -C $(QEMU_DIR) diff -- hw/arm/Kconfig hw/arm/meson.build > $(QEMU_PATCH)" >&2; \
+		echo "Regenerate it: git -C $(QEMU_DIR) diff -- hw/arm/Kconfig hw/arm/meson.build hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdhci-internal.h hw/sd/sdmmc-internal.h target/arm/helper.c > $(QEMU_PATCH)" >&2; \
 		exit 1; \
 	fi
 	@mkdir -p $(QEMU_BUILD)
@@ -165,6 +165,58 @@ linux-dtb: dts/rk3588-qemu.dts
 		-I dts -O dtb -o /tmp/opencode/p5.dtb dts/rk3588-qemu.dts
 	python3 -c "d=open('/tmp/opencode/p5.dtb','rb').read(); \
 	open('$(LINUX_DTB)','wb').write(d+b'\0'*(0x20000-len(d)))"
+
+STOCK_DTB := linux/linux-7.2.9/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtb
+images/rk3588s-orangepi-5-stock.dtb: $(STOCK_DTB)
+	mkdir -p images
+	python3 -c "d=open('$(STOCK_DTB)','rb').read(); \
+	open('images/rk3588s-orangepi-5-stock.dtb','wb').write(d+b'\0'*(0x20000-len(d)))"
+
+# Stock DTB with ONLY the eMMC node (sdhci@fe2e0000) enabled (status="okay"),
+# exactly the Armbian board patch: the mainline node already carries
+# bus-width 8 / supports-cqe / mmc-hs400-1_8v / mmc-hs400-enhanced-strobe.
+# The cpu-idle-states references are dropped as well: the deep PSCI suspend
+# state drives TF-A into cortex-a76_core_pwr_dwn, whose CPUECTLR_EL3 read
+# (s3_0_c15_c2_7) is UNDEF under TCG and warm-resets the machine.
+EMMC_DTB := images/rk3588s-orangepi-5-emmc.dtb
+$(EMMC_DTB): images/rk3588s-orangepi-5-stock.dtb
+	cp images/rk3588s-orangepi-5-stock.dtb $(EMMC_DTB)
+	fdtput -t s $(EMMC_DTB) /mmc@fe2e0000 status okay
+	for cpu in $$(fdtget -l $(EMMC_DTB) /cpus); do \
+		fdtput -d $(EMMC_DTB) /cpus/$$cpu cpu-idle-states 2>/dev/null || true; \
+	done
+
+# P12 stock-DTB milestone: identical to run-linux but with the unmodified
+# in-tree rk3588s-orangepi-5 DTB (Armbian kernel DTBs derive from it).
+run-linux-stock: $(QEMU_BIN) images/rk3588s-orangepi-5-stock.dtb $(INITRD_BIN) images/emmc.img
+	mkdir -p $(LOG_DIR)
+	-timeout 290 $(QEMU_RK3588) \
+		-bios atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
+		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
+		-device loader,file=images/rk3588s-orangepi-5-stock.dtb,addr=0x0a100000,force-raw=on \
+		-dtb u-boot/dts/dt.dtb \
+		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
+		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-stock-int.log \
+		> $(LOG_DIR)/run-linux-stock.txt 2>&1
+	@tr -d '\r' < $(LOG_DIR)/run-linux-stock.txt | grep -a "LINUX-OK\|Run /init\|Kernel panic\|Starting kernel\|ttyS2" || true
+
+# P13 eMMC milestone: stock-DTB boot with the eMMC node enabled - drives the
+# dwcmshc HS200/HS400 + DLL + CQE (CQHCI) paths in the model.
+run-linux-emmc: $(QEMU_BIN) $(EMMC_DTB) $(INITRD_BIN) images/emmc.img
+	mkdir -p $(LOG_DIR)
+	-timeout 290 $(QEMU_RK3588) \
+		-bios atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
+		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
+		-device loader,file=$(EMMC_DTB),addr=0x0a100000,force-raw=on \
+		-dtb u-boot/dts/dt.dtb \
+		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
+		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-emmc-int.log \
+		> $(LOG_DIR)/run-linux-emmc.txt 2>&1
+	@tr -d '\r' < $(LOG_DIR)/run-linux-emmc.txt | grep -aE "LINUX-OK|Run /init|Kernel panic|Starting kernel|ttyS2|mmc0:|\[PASS\]|\[FAIL\]|CQHCI|tuning|HS[0-9]+|dwcmshc" || true
 
 run-linux: $(QEMU_BIN) $(LINUX_DTB) $(INITRD_BIN) images/emmc.img
 	mkdir -p $(LOG_DIR)

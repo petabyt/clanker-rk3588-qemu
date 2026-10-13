@@ -18,7 +18,7 @@
 # Third-party source trees: separate checkouts/downloads.
 # Deltas live outside the tree: qemu.patch + the src symlink for ./qemu,
 # plan.md build notes for u-boot/atf/linux, rk's own git repo for ./rk.
-/qemu/
+#/qemu/
 /u-boot/
 /linux/
 /atf/
@@ -37,3 +37,4 @@ rk3588_ddr_lp4_2112MHz_lp5_2400MHz_v1.16.bin.c
 logs.txt
 /edk2/
 /board-runs/
+Armbian*

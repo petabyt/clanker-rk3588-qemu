@@ -169,6 +169,18 @@ static uint64_t rk_stub_cru_read(uint32_t stored, hwaddr off)
  */
 static uint32_t rk_pmu_pwr_gate_en;
 
+/*
+ * PMU_BUS_IDLE_REQ0/1 (0x810c/0x8110) -> IDLE_ACK (0x8118) and
+ * PMU2_IDLE (0x8120, and 0x8124 for the domains with a m_offset of 4):
+ * the Linux rockchip-pm-domains driver (rk3588_pmu: req_offset 0x10c,
+ * ack_offset 0x118, idle_offset 0x120) polls ack/idle until they mirror
+ * the request bits - same bit for requests in the low word (0x10c), +16
+ * for the high one (0x110).  The TPL DDR-resume path is the same rule
+ * (SFTCON1 bits 12-15 -> ack bits 28-31, kept below as a legacy OR).
+ * No BIU traffic is modelled, so the ack is immediate.
+ */
+static uint32_t rk_pmu_idle_req[2];
+
 static void rk_stub_pmu_write(hwaddr off, uint64_t value)
 {
     if (off == 0x8154) {
@@ -176,6 +188,17 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
         uint32_t data = value & 0x3;
 
         rk_pmu_pwr_gate_en = (rk_pmu_pwr_gate_en & ~wen) | (data & wen);
+    }
+    if (off == 0x810c || off == 0x8110) {
+        uint32_t idx = (off - 0x810c) / 4;
+        uint32_t wen = value >> 16;
+
+        if (wen) {
+            rk_pmu_idle_req[idx] =
+                (rk_pmu_idle_req[idx] & ~wen) | (value & wen);
+        } else {
+            rk_pmu_idle_req[idx] = value;    /* plain regmap write */
+        }
     }
 }
 
@@ -196,14 +219,34 @@ static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
         return stored | 0xfe;
     }
     /*
-     * PMU_BIU_IDLE_ACK_STS0 (0x8118) and PMU2 idle status (0x8120): bits
-     * 28-31 acknowledge the DDRSCH0-3 idle requests. The TPL DDR-resume
-     * path (its warm-reset entry after BL31's save path) requests idle via
-     * SFTCON1 (0x8110, bits 12-15) and polls these for the ack. No BIU
-     * traffic is modelled, so the ack is immediate.
+     * PMU_BIU_IDLE_ACK_STS0 (0x8118), PMU2 idle status (0x8120) and the
+     * m_offset-4 idle word (0x8124): mirror the request bits (see
+     * rk_stub_pmu_write above); bits 28-31 additionally acknowledge the
+     * DDRSCH0-3 idle requests for the TPL DDR-resume path (SFTCON1
+     * 0x8110, bits 12-15).
      */
-    if (off == 0x8118 || off == 0x8120) {
-        return stored | 0xf0000000u;
+    if (off == 0x8118 || off == 0x8120 || off == 0x8124) {
+        uint32_t mirror = (rk_pmu_idle_req[0] & 0xffff) |
+                          ((rk_pmu_idle_req[1] & 0xffff) << 16);
+
+        return stored | mirror | 0xf0000000u;
+    }
+    /*
+     * Linux rockchip-pm-domains (drivers/pmdomain/rockchip/pm-domains.c,
+     * syscon window fd8d8000; offsets relative to fd8d0000 below): report
+     * every domain powered and every chain up, with no power model.
+     *   +0x8180 status   (1'b1 = off)          -> 0: all domains on
+     *   +0x81f0 chain status (1'b1 = up)       -> all chains up
+     *   +0x81f8 mem status  (1'b1 = off)       -> 0: all mem on
+     *   +0x8290 repair status (1'b1 = on)      -> all domains on
+     * power_on then short-circuits in rockchip_pd_power(); power_off
+     * polls fail after the 10 ms readx timeout and the domain stays on.
+     */
+    if (off == 0x8180 || off == 0x81f8) {
+        return 0;
+    }
+    if (off == 0x81f0 || off == 0x8290) {
+        return 0xffffffffu;
     }
     return stored;
 }
@@ -930,6 +973,71 @@ static const RkStubBlock rk_stub_blocks[] = {
       .read_hook = rk_stub_otp_read },
     { .name = "trng", .base = 0xfe378000, .size = 0x200,
       .read_hook = rk_stub_rng_read },
+    /*
+     * PL330 DMAC register tails.  The stock rk3588s DTB gives each
+     * dma-controller a 0x4000 reg window while QEMU's in-tree pl330
+     * model maps only 0x1000 (with its periph-ID cells at +0xfe0).
+     * Linux 7.2.9's amba_read_periphid() reads pid/cid at the END of
+     * the DTB window (base + size - 0x20/- 0x10), so [base+0x1000,
+     * base+0x4000) must be mapped and answer with the same ID bytes
+     * the model returns at +0xfe0 (pl330_id[]): pid 0x241330 ->
+     * 0x41330 under the driver's 0x000fffff mask, cid 0xB105F00D.
+     * Plain RW so the driver's channel/mgr register traffic in the
+     * first page still lands in the real device, and any stray probe
+     * read in the tail reads back storage (0).
+     */
+    { .name = "dmac0-tail", .base = 0xfea11000, .size = 0x3000,
+      .reset_vals = (const RkStubResetVal[]) {
+        { 0x2fe0, 0x00000030 }, { 0x2fe4, 0x00000013 },
+        { 0x2fe8, 0x00000024 }, { 0x2fec, 0x00000000 },
+        { 0x2ff0, 0x0000000d }, { 0x2ff4, 0x000000f0 },
+        { 0x2ff8, 0x00000005 }, { 0x2ffc, 0x000000b1 },
+      }, .n_reset_vals = 8 },
+    { .name = "dmac1-tail", .base = 0xfea31000, .size = 0x3000,
+      .reset_vals = (const RkStubResetVal[]) {
+        { 0x2fe0, 0x00000030 }, { 0x2fe4, 0x00000013 },
+        { 0x2fe8, 0x00000024 }, { 0x2fec, 0x00000000 },
+        { 0x2ff0, 0x0000000d }, { 0x2ff4, 0x000000f0 },
+        { 0x2ff8, 0x00000005 }, { 0x2ffc, 0x000000b1 },
+      }, .n_reset_vals = 8 },
+    { .name = "dmac2-tail", .base = 0xfed11000, .size = 0x3000,
+      .reset_vals = (const RkStubResetVal[]) {
+        { 0x2fe0, 0x00000030 }, { 0x2fe4, 0x00000013 },
+        { 0x2fe8, 0x00000024 }, { 0x2fec, 0x00000000 },
+        { 0x2ff0, 0x0000000d }, { 0x2ff4, 0x000000f0 },
+        { 0x2ff8, 0x00000005 }, { 0x2ffc, 0x000000b1 },
+      }, .n_reset_vals = 8 },
+    /*
+     * Stock-DTB (P12) round: the remaining enabled rk3588s DTB windows
+     * that no model covers yet.  Plain storage so the mainline drivers
+     * (CONFIG_ARM_SMMU_V3=y etc) read IDs as 0 and fail their probes
+     * gracefully instead of taking an external abort that kills init.
+     * Revisit per-device as needed (panthor/snd/thermal are =m and do
+     * not probe during the initramfs boot).
+     */
+    { .name = "smmu-v3", .base = 0xfc900000, .size = 0x2000 },
+    { .name = "gpu", .base = 0xfb000000, .size = 0x2000 },
+    { .name = "npu", .base = 0xfdab0000, .size = 0x30000 },
+    { .name = "codecs", .base = 0xfdb50000, .size = 0x60000 },
+    { .name = "vdec", .base = 0xfdc38000, .size = 0xd000 },
+    { .name = "av1", .base = 0xfdc70000, .size = 0x1000 },
+    { .name = "av1-iommu", .base = 0xfdca0000, .size = 0x1000 },
+    { .name = "vop-mmu-gap", .base = 0xfdd97000, .size = 0xe00 },
+    { .name = "i2s-tdm0", .base = 0xfddf0000, .size = 0x1000 },
+    { .name = "i2s-tdm2", .base = 0xfe480000, .size = 0x1000 },
+    { .name = "tsadc", .base = 0xfec00000, .size = 0x1000 },
+    { .name = "wdt", .base = 0xfeaf0000, .size = 0x100 },
+    { .name = "dfi", .base = 0xfe060000, .size = 0x1000 },
+    /*
+     * QoS register files (qos@fdf3xxxx-fdf4xxxx / fdf6 / fdf7 / fdf8):
+     * rockchip-pm-domain save/restore_qos() reads PRI/MODE/BW/SAT/EXT
+     * (offsets 0x08..0x1c of each 0x20 window) on every domain power
+     * transition, so the whole spans need to be mapped.
+     */
+    { .name = "qos-a", .base = 0xfdf35000, .size = 0xe000 },
+    { .name = "qos-b", .base = 0xfdf60000, .size = 0x8000 },
+    { .name = "qos-c", .base = 0xfdf70000, .size = 0x3000 },
+    { .name = "qos-d", .base = 0xfdf80000, .size = 0x3000 },
 };
 
 void rk3588_create_stub_regions(MemoryRegion *sysmem)

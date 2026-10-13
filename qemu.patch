@@ -1,8 +1,8 @@
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index 4445f16..6a52e23 100644
+index 4445f16..317c847 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -155,6 +155,14 @@ config REALVIEW
+@@ -155,6 +155,15 @@ config REALVIEW
      select DS1338 # I2C RTC+NVRAM
      select USB_OHCI_SYSBUS
  
@@ -13,19 +13,224 @@ index 4445f16..6a52e23 100644
 +    select DEVICE_TREE
 +    select ARM_GIC
 +    select UNIMP
++    select PL330
 +
  config SBSA_REF
      bool
      default y
 diff --git a/hw/arm/meson.build b/hw/arm/meson.build
-index bcc068d..99a370f 100644
+index bcc068d..9f6ad09 100644
 --- a/hw/arm/meson.build
 +++ b/hw/arm/meson.build
 @@ -12,6 +12,7 @@ arm_common_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx.c', 'npcm7xx_b
  arm_common_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm8xx.c', 'npcm8xx_boards.c'))
  arm_common_ss.add(when: 'CONFIG_REALVIEW', if_true: files('realview.c'))
  arm_common_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa-ref.c'))
-+arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-sdhci.c'))
++arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c'))
  arm_common_ss.add(when: 'CONFIG_STELLARIS', if_true: files('stellaris.c'))
  arm_common_ss.add(when: 'CONFIG_STM32VLDISCOVERY', if_true: files('stm32vldiscovery.c'))
  arm_common_ss.add(when: 'CONFIG_ZYNQ', if_true: files('xilinx_zynq.c'))
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index b1b3b12..56c0162 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -535,11 +535,15 @@ static void emmc_set_ext_csd(SDState *sd, uint64_t size)
+     sd->ext_csd[207] = 0x46; /* Min read perf for 4bit@52Mhz */
+     sd->ext_csd[206] = 0x46; /* Min write perf for 4bit@26Mhz */
+     sd->ext_csd[205] = 0x46; /* Min read perf for 4bit@26Mhz */
+-    sd->ext_csd[EXT_CSD_CARD_TYPE] = 0b11;
++    sd->ext_csd[EXT_CSD_CARD_TYPE] = 0b11010111;
++    sd->ext_csd[EXT_CSD_STROBE_SUPPORT] = 0x01; /* enhanced strobe */
+     sd->ext_csd[EXT_CSD_STRUCTURE] = 2;
+-    sd->ext_csd[EXT_CSD_REV] = 5;
++    /* eMMC 5.1: rev >= 8 is required for the guest to decode CMDQ support */
++    sd->ext_csd[EXT_CSD_REV] = 8;
+     sd->ext_csd[EXT_CSD_RPMB_MULT] = sd->rpmb_part_size / (128 * KiB);
+     sd->ext_csd[EXT_CSD_PARTITION_SUPPORT] = 0b111;
++    sd->ext_csd[EXT_CSD_CMDQ_SUPPORT] = 0b1;   /* command queue supported */
++    sd->ext_csd[EXT_CSD_CMDQ_DEPTH] = 0x1f;    /* queue depth 32 */
+ 
+     /* Mode segment (RW) */
+     sd->ext_csd[EXT_CSD_PART_CONFIG] = sd->boot_config;
+@@ -746,6 +750,24 @@ static const uint8_t sd_tuning_block_pattern4[64] = {
+     0xbb, 0xff, 0xf7, 0xff,     0xf7, 0x7f, 0x7b, 0xde
+ };
+ 
++/* CMD21 (eMMC): SEND_TUNING_BLOCK_HS200 - HS200/HS400 tuning pattern.
++ * HS200/HS400 tuning always runs on an 8-bit bus, i.e. a 128-byte block
++ * (the SD CMD19 pattern repeated twice). */
++static sd_rsp_type_t sd_cmd_to_sendingdata(SDState *sd, SDRequest req,
++                                           uint64_t start,
++                                           const void *data, size_t size);
++static sd_rsp_type_t emmc_cmd_SEND_TUNING_BLOCK(SDState *sd, SDRequest req)
++{
++    uint8_t pattern[2 * sizeof(sd_tuning_block_pattern4)];
++
++    memcpy(pattern, sd_tuning_block_pattern4,
++           sizeof(sd_tuning_block_pattern4));
++    memcpy(pattern + sizeof(sd_tuning_block_pattern4),
++           sd_tuning_block_pattern4, sizeof(sd_tuning_block_pattern4));
++
++    return sd_cmd_to_sendingdata(sd, req, 0, pattern, sizeof(pattern));
++}
++
+ static int sd_req_crc_validate(SDRequest *req)
+ {
+     uint8_t buffer[5];
+@@ -2843,6 +2865,7 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
+     case 13: /* ACMD13: SD_STATUS */
+     case 17: /* CMD17:  READ_SINGLE_BLOCK */
+     case 19: /* CMD19:  SEND_TUNING_BLOCK (SD) */
++    case 21: /* CMD21:  SEND_TUNING_BLOCK_HS200 (eMMC) */
+     case 22: /* ACMD22: SEND_NUM_WR_BLOCKS */
+     case 30: /* CMD30:  SEND_WRITE_PROT */
+     case 51: /* ACMD51: SEND_SCR */
+@@ -3037,6 +3060,7 @@ static const SDProto sd_proto_emmc = {
+         [16] = {2,  sd_ac,   "SET_BLOCKLEN", sd_cmd_SET_BLOCKLEN},
+         [17] = {2,  sd_adtc, "READ_SINGLE_BLOCK", sd_cmd_READ_SINGLE_BLOCK},
+         [19] = {0,  sd_adtc, "BUSTEST_W", sd_cmd_unimplemented},
++        [21] = {2,  sd_adtc, "SEND_TUNING_BLOCK_HS200", emmc_cmd_SEND_TUNING_BLOCK},
+         [20] = {3,  sd_adtc, "WRITE_DAT_UNTIL_STOP", sd_cmd_unimplemented},
+         [23] = {2,  sd_ac,   "SET_BLOCK_COUNT", sd_cmd_SET_BLOCK_COUNT},
+         [24] = {4,  sd_adtc, "WRITE_SINGLE_BLOCK", sd_cmd_WRITE_SINGLE_BLOCK},
+diff --git a/hw/sd/sdhci-internal.h b/hw/sd/sdhci-internal.h
+index 2116995..2841f62 100644
+--- a/hw/sd/sdhci-internal.h
++++ b/hw/sd/sdhci-internal.h
+@@ -46,7 +46,7 @@
+ #define SDHC_TRNS_ACMD23               0x0008 /* since v3 */
+ #define SDHC_TRNS_READ                 0x0010
+ #define SDHC_TRNS_MULTI                0x0020
+-#define SDHC_TRNMOD_MASK               0x0037
++#define SDHC_TRNMOD_MASK               0x003F
+ 
+ /* R/W Command Register 0x0 */
+ #define SDHC_CMDREG                    0x0E
+diff --git a/hw/sd/sdhci.c b/hw/sd/sdhci.c
+index bd74c60..a1f2dc3 100644
+--- a/hw/sd/sdhci.c
++++ b/hw/sd/sdhci.c
+@@ -364,6 +364,23 @@ static void sdhci_send_command(SDHCIState *s)
+     request.cmd = s->cmdreg >> 8;
+     request.arg = s->argument;
+ 
++    /*
++     * Automatically send CMD23 (SET_BLOCK_COUNT) before a multi-block
++     * data command when Auto CMD23 is enabled: the card needs the block
++     * count to terminate the transfer by itself; without it an
++     * open-ended CMD18/25 leaves the card stuck in the data-transfer
++     * state after the host has finished the transfer.
++     */
++    if ((s->trnmod & SDHC_TRNS_ACMD23) &&
++        (s->trnmod & SDHC_TRNS_MULTI) &&
++        (s->cmdreg & SDHC_CMD_DATA_PRESENT)) {
++        SDRequest acmd23 = {
++            .cmd = 23,
++            .arg = s->blkcnt,
++        };
++        sdbus_do_command(&s->sdbus, &acmd23, response, sizeof(response));
++    }
++
+     trace_sdhci_send_command(request.cmd, request.arg);
+     rlen = sdbus_do_command(&s->sdbus, &request, response, sizeof(response));
+ 
+@@ -450,10 +467,13 @@ static void sdhci_read_block_from_card(SDHCIState *s)
+         return;
+     }
+ 
+-    if (!FIELD_EX32(s->hostctl2, SDHC_HOSTCTL2, EXECUTE_TUNING)) {
+-        /* Device is not in tuning */
+-        sdbus_read_data(&s->sdbus, s->fifo_buffer, blk_size);
+-    }
++    /*
++     * Consume the block from the card in tuning mode as well: the
++     * driver never reads the tuning pattern (no Buffer Data Port
++     * access), so a skipped read would leave the card stuck in the
++     * data-transfer state.
++     */
++    sdbus_read_data(&s->sdbus, s->fifo_buffer, blk_size);
+ 
+     if (FIELD_EX32(s->hostctl2, SDHC_HOSTCTL2, EXECUTE_TUNING)) {
+         /* Device is in tuning */
+@@ -461,6 +481,14 @@ static void sdhci_read_block_from_card(SDHCIState *s)
+         s->hostctl2 |= R_SDHC_HOSTCTL2_SAMPLING_CLKSEL_MASK;
+         s->prnsts &= ~(SDHC_DAT_LINE_ACTIVE | SDHC_DOING_READ |
+                        SDHC_DATA_INHIBIT);
++        /*
++         * The tuning cycle is a data-less 64/128-byte read: the driver
++         * (sdhci_send_tuning) completes the cycle on Buffer Read Ready,
++         * so raise it here or the tuning window times out.
++         */
++        if (s->norintstsen & SDHC_NISEN_RBUFRDY) {
++            s->norintsts |= SDHC_NIS_RBUFRDY;
++        }
+         goto read_done;
+     }
+ 
+diff --git a/hw/sd/sdmmc-internal.h b/hw/sd/sdmmc-internal.h
+index f9282a9..0b92e76 100644
+--- a/hw/sd/sdmmc-internal.h
++++ b/hw/sd/sdmmc-internal.h
+@@ -21,6 +21,8 @@ DECLARE_OBJ_CHECKERS(SDState, SDCardClass, SDMMC_COMMON, TYPE_SDMMC_COMMON)
+  * These modes can be changed by the host by means of the SWITCH command.
+  */
+ #define EXT_CSD_CMDQ_MODE_EN            15      /* R/W */
++#define EXT_CSD_CMDQ_DEPTH              307     /* RO */
++#define EXT_CSD_CMDQ_SUPPORT            308     /* RO */
+ #define EXT_CSD_FLUSH_CACHE             32      /* W */
+ #define EXT_CSD_CACHE_CTRL              33      /* R/W */
+ #define EXT_CSD_POWER_OFF_NOTIFICATION  34      /* R/W */
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index ff0b766..149ed76 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -25,6 +25,7 @@
+ #include "exec/icount.h"
+ #include "system/kvm.h"
+ #include "system/tcg.h"
++#include "system/runstate.h"
+ #include "qapi/error.h"
+ #include "qemu/guest-random.h"
+ #ifdef CONFIG_TCG
+@@ -486,6 +487,25 @@ static CPAccessResult access_tacr(CPUARMState *env, const ARMCPRegInfo *ri,
+     return CP_ACCESS_OK;
+ }
+ 
++/*
++ * RMR_EL3/RMR: AA64 (bit 0) reads as 1. A write with RR (bit 1) requests a
++ * warm reset. The guest uses it to restart through reset (rk3588 BL31 0x58874);
++ * here that is a full machine reset, and RAM/stub state survive it as on
++ * the part.
++ */
++static uint64_t rmr_read(CPUARMState *env, const ARMCPRegInfo *ri)
++{
++    return 1;
++}
++
++static void rmr_write(CPUARMState *env, const ARMCPRegInfo *ri,
++                      uint64_t value)
++{
++    if (value & 2) {
++        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++    }
++}
++
+ static void dacr_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
+ {
+     ARMCPU *cpu = env_archcpu(env);
+@@ -7227,11 +7247,12 @@ void register_cp_regs_for_features(ARMCPU *cpu)
+               .fieldoffset = offsetof(CPUARMState, cp15.rvbar), },
+             { .name = "RMR_EL3", .state = ARM_CP_STATE_AA64,
+               .opc0 = 3, .opc1 = 6, .crn = 12, .crm = 0, .opc2 = 2,
+-              .access = PL3_RW, .type = ARM_CP_CONST, .resetvalue = 1 },
++              .access = PL3_RW, .type = ARM_CP_NO_RAW,
++              .readfn = rmr_read, .writefn = rmr_write },
+             { .name = "RMR", .state = ARM_CP_STATE_AA32,
+               .cp = 15, .opc1 = 0, .crn = 12, .crm = 0, .opc2 = 2,
+-              .access = PL3_RW, .type = ARM_CP_CONST,
+-              .resetvalue = arm_feature(env, ARM_FEATURE_AARCH64) },
++              .access = PL3_RW, .type = ARM_CP_NO_RAW,
++              .readfn = rmr_read, .writefn = rmr_write },
+             { .name = "SCTLR_EL3", .state = ARM_CP_STATE_AA64,
+               .opc0 = 3, .opc1 = 6, .crn = 1, .crm = 0, .opc2 = 0,
+               .access = PL3_RW, .fgt = FGT_SCTLR_EL3,

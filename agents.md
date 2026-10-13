@@ -85,8 +85,11 @@ it is far easier to grep and read a few hundred lines than to page through PDFs.
 
 ## Rules
 1. qemu/ gets only qemu.patch + the hw/arm/rk3588 symlink (the Makefile applies both).
-   To edit the patch: edit hw/arm/Kconfig and/or hw/arm/meson.build in qemu/ directly,
-   then `git -C qemu diff -- hw/arm/Kconfig hw/arm/meson.build > qemu.patch`.
+   To edit the patch: edit the file in qemu/ directly, then regenerate the full list:
+   `git -C qemu diff -- hw/arm/Kconfig hw/arm/meson.build hw/sd/sd.c hw/sd/sdhci.c
+   hw/sd/sdhci-internal.h hw/sd/sdmmc-internal.h target/arm/helper.c > qemu.patch`
+   (the list must cover EVERY file edited in qemu/ - a partial list silently drops
+   the missing hunks from the patch, which is how target/arm/helper.c went missing).
    `make` re-applies it idempotently: pristine -> apply, already applied -> verify,
    out of sync -> error with that regeneration hint.
 2. New/changed device code goes in ./src, follows QEMU style (QOM for stateful

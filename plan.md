@@ -1011,7 +1011,9 @@ P10 (user request 2026-10-08) Boot the UNMODIFIED orangepi-5_UEFI_Release_v1.1.i
               against the existing DDR stubs (ddr-probe/ddr-cfg, P8). SPL loads the
               FIT from the card. Exit: one log showing ROM -> TPL -> SPL -> U-Boot ->
               FIT -> Shell>.
-              STATUS: IN PROGRESS (2026-10-08). Blocked at the SPL's hardware SHA-256.
+              STATUS: DONE (2026-10-11).  See "PHASE 2 EXIT EVIDENCE" at the
+              end of this phase block; everything below is the historical
+              debugging trail that led there (kept per the durable-log rule).
               Done this phase:
                 - src/rk3588.c: with no -bios, rk3588_parse_v2_from_sd() reads the
                   idbloader header at 0x8000 through the SD card's block backend and
@@ -1098,6 +1100,9 @@ P10 (user request 2026-10-08) Boot the UNMODIFIED orangepi-5_UEFI_Release_v1.1.i
               pmu.c's nonboot-CPU wait succeeds ("nonboot cpus status(0)" gone).
               With no-card SD boot: 0 invalid, BL31 prints NOTICE and no longer
               parks at the mailbox fault.
+              [SUPERSEDED 2026-10-11: the 0x52adc fault is gone at the
+              current tree state — see the atf-1 STATUS note and the PHASE 2
+              EXIT EVIDENCE below.  Kept as the debugging trail.]
               CURRENT BLOCKER: Data Abort, FAR=0x4, ELR 0x52adc. Caller 0x500d8
               (from 0x50188, boot init) does x0 = 0x54eb4(idx), idx = [0x61f1c] = 1,
               which selects table 0x67ac0; its +8 pointer is NULL (BSS, not in the
@@ -1548,9 +1553,85 @@ P10 (user request 2026-10-08) Boot the UNMODIFIED orangepi-5_UEFI_Release_v1.1.i
                 "P8 rc=0" claim is not reproducible now.
               - Regressions at the current tree state: canonical U-Boot prompt=1
                 invalid=0; EDK2 banner=2 invalid=0; own-BL31 SD chain NOTICE, 0 invalid.
+              - POST-`out` SPL SILENCE ROOT CAUSE (2026-10-11): after the
+                v1.18 TPL trained to `out`, the chain went silent — no SPL
+                banner.  Monitor dump at the hang: memory at 0x0 held the
+                DQ-test walking-ones pattern (fe/ff/ff/ff, fd/ff/ff/ff, ...)
+                instead of the SPL image.  The TPL's DDR training writes
+                test patterns across low DRAM (the DQ write/read test stores
+                at the channel-interleave bases ch<<33, which the wrap
+                aliases map onto low RAM — channel 0's base is 0 directly),
+                so the SPL pre-staged at address 0 at init time was clobbered
+                before the TPL returned.  The real BootROM loads the main
+                image only AFTER the DDR blob returns.
+                FIX (src/rk3588.c): the main image bytes are kept in a
+                QEMU-side shadow buffer (rk3588_spl_shadow) instead of being
+                staged at 0 at init, and the DDR blob's return address (x30)
+                now points at a one-instruction MMIO "BootROM resume
+                vector" at 0xFFFF0000 (rk3588_bootrom_ret_ops): the first
+                instruction fetch stages the shadowed image to address 0,
+                restores the bootrom call contract (x0=bootdata, x1=8),
+                rewires x30 to 0 and hands out `br x30` — entering the
+                main image exactly as the real BootROM does.  (MMIO code
+                fetch works in TCG; the staging is rearmed on every reset.)
+                Result: `out` -> "U-Boot SPL board init / U-Boot SPL
+                2017.09-g5f53abfa1e-221223" -> "Trying fit image at 0x800
+                sector" -> all six FIT nodes sha256 + OK -> "Jumping to
+                U-Boot(0x00200000) via ARM Trusted Firmware(0x00040000)".
+              - atf-1 (stock BL31) STATUS (2026-10-11): the 0x52adc NULL
+                fault is GONE with no new work — the P11-era CRU/stub
+                changes fixed its early init.  Observed vendor save/reset
+                dance: first entry is SILENT (saves DDR training data, then
+                warm-resets via RMR_EL3), second entry after the TPL resume
+                pass prints "NOTICE:  BL31: v2.12.0(release):d5c68fd /
+                Built : 22:10:40, Apr  9 2025" and proceeds to BL33.
+                Note (model quirk): the warm pass trains "LPDDR5, 2400MHz"
+                vs the cold pass "LPDDR4X, 2112MHz" (stub MR data differs
+                on the resume path); atf-1 tolerates it and proceeds.
+              - IDMAC ANSWER (2026-10-11, temporary env-gated debug in
+                rk3588-dwmshc.c, since removed): the stock SPL uses BOTH —
+                30 IDMAC data transfers (CMD17/18 reads) and 177 PIO
+                transfers.  The Phase-1 IDMAC descriptor walk is exercised
+                live by the stock SPL.
+              - PHASE 2 EXIT EVIDENCE (2026-10-11).  Exit command:
+                timeout 300 build/qemu/qemu-system-aarch64 -M rk3588 -nographic \
+                  -serial mon:stdio -drive if=sd,file=/tmp/opencode/sd-scratch.img,format=raw \
+                  -d int,invalid_mem,guest_errors -D logs/p12-long-int.log > logs/p12-long.txt
+                Output: ROM(-lite) -> TPL trains (LPDDR4X 2112MHz, F1->F0)
+                -> `out` -> U-Boot SPL 2017.09 -> FIT at 0x800 sector, six
+                nodes sha256 + OK -> "Jumping to U-Boot(0x00200000) via ARM
+                Trusted Firmware(0x00040000)" -> silent atf-1 save pass +
+                RMR warm reset -> TPL resume pass -> `out` -> SPL -> FIT ->
+                "NOTICE:  BL31: v2.12.0(release):d5c68fd" -> "UEFI firmware
+                (version v1.1 built at 22:11:54 on Apr  9 2025)" -> EDK2
+                front page (Select Language / Device Manager / Boot
+                Manager / ...).  Invalid accesses: 0.
+                Interactive continuation (serial unix socket driver, P6
+                technique): 2x down + Enter -> "Boot Manager Menu" (entries:
+                UEFI Shell, Reset to MaskROM, "UEFI Generic QEMU! EFBEADDE
+                SD Device [Fw]") -> Enter -> "UEFI Interactive Shell v2.2 /
+                EDK II / UEFI v2.70 (EDK II, 0x00010000)" -> `Shell>` ->
+                ver.  Saved: logs/p12-shell-proof.txt.
+                Evidence files: logs/p12-long.txt (front-page run),
+                logs/p12-splfix.txt (first post-fix chain),
+                logs/p12-idmac-qemu.txt (IDMAC/PIO debug counts),
+                logs/p12-appimage-smoke.txt.
+                Regressions at this state: U-Boot prompt=1 invalid=0;
+                EDK2 banner=2 invalid=0; `make sd-own-bl31` chain intact
+                (atf-1 verified, jump, our BL31 v2.15 NOTICE);
+                `make run-linux` LINUX-OK (P11 unaffected); appimage
+                rebuilt + smoke: stock chain to "Jumping to U-Boot" via
+                squashfs-root/AppRun.
       Phase 3 Raw loader for atf-1 from the FIT; drop our bl31.elf for this run. Exit:
               full chain with no component of ours, plus the canonical U-Boot
               regression (=> prompt, 0 invalid accesses) still passing.
+              STATUS: DONE (2026-10-11) — subsumed by the Phase 2 exit
+              evidence above: the chain runs with NO component of ours (no
+              -bios at all; the stock SPL itself loads the raw atf-1 from
+              the FIT at 0x40000 through the dw-mshc + crypto models, and
+              the canonical U-Boot regression passes at the same tree
+              state).  The "ELF-only loader" work item never became
+              necessary because the SPL does the raw load on hardware.
     Every phase ends with a pasted exit command, per the milestone rule. Changes stay
     local (qemu/AGENTS.md policy: agent code is not for upstream contribution).
     After the milestone: make appimage + smoke test (agents.md rule 8).
@@ -1731,36 +1812,59 @@ P11 (user directive 2026-10-10, next step toward the unmodified-Armbian goal)
       clocks resolve, resets provider registered, and the P6 DRM
       chain still boots (bound vop/hdmi, fbcon 240x67, LINUX-OK in
       the same run — no P6 regression from the CRU migration).
-    - CURRENT BLOCKER (precise resume point): the eMMC host fully
-      probes ("mmc1: SDHCI controller on fe2e0000.mmc [fe2e0000.mmc]
-      using ADMA") and commands reach the card (trace:sdbus_command:
-      CMD52/CMD5/CMD55 correctly ignored by the eMMC proto; guest
-      errors log shows the expected "wrong state: idle" for them),
-      but the card never answers CMD1 and stays in idle:
-      "eMMC: CMD8 in a wrong state: idle" at the EXT_CSD stage and
-      "error -110 whilst initialising MMC card" after the 10 s
-      timeout.  No sdhci_response4 trace events => no response is
-      ever latched.  sd_cmd_SEND_OP_COND (shared ACMD41 handler)
-      returns sd_r3 only after the OCR/VDD-window check; CMD0's
-      sd_reset -> sd_set_ocr sets sd->ocr = R_OCR_VDD_VOLTAGE_WIN_HI
-      (voltage-window bits) and the kernel's CMD1 goes out with
-      arg 0x40ffff00.  Next: rerun with
-      -d trace:sdhci_response4,trace:sdhci_response16,trace:sdbus_command
-      and read the CMD1 OCR the card returns vs the kernel's arg
-      (suspect: the response IS sd_r3 but the sdhci rspreg latch or
-      the VDD-window bit overlap — R_OCR_VDD_VOLTAGE_WIN_HI_MASK vs
-      0x40ffff00 — leaves the card in idle so CMD2/3/7 never advance
-      it; also check the inquiry-CMD1 powerup timer path).
-      Evidence: logs/p11-progress-boot-2026-10-10.txt,
-      logs/p11-sdbus-trace-2026-10-10.txt,
-      logs/p11-sdhci-access-trace-2026-10-10.txt (CLOCK_CONTROL
-      handshake 0x4->0x2005->0x7 visible),
-      logs/p11-guest-errors-summary-2026-10-10.txt.
+    - BLOCKER RESOLVED (2026-10-11).  Root cause (found by tracing +
+      a temporary subclass write-hook logger, since reverted): NOT
+      the card protocol — the card answered CMD1 (busy bit), CMD2
+      CID, CMD3, CMD9 CSD, CMD7 and CMD8 R1 (state "tran") fine.
+      The stall was the CMD8 EXT_CSD *data* phase: QEMU's Transfer
+      Mode register write handler (sdhci.c case SDHC_TRNMOD) strips
+      SDHC_TRNS_DMA ("DMA can be enabled only if it is supported")
+      unless capareg advertises SDMA (FIELD(SDHC_CAPAB, SDMA, 22)).
+      Our capareg had ADMA2 (bit 19) but not bit 22, so the kernel
+      — which selects ADMA2 (hostctl 0x11), enables DMA-mode buffer
+      irqs (ier 0x0b: RESPONSE|DATA_END|DMA_END) and an ADMA2
+      descriptor table — had every data command silently degraded
+      to the controller-internal PIO path, which fills the FIFO and
+      raises only BUF_RDY, an irq the kernel had disabled => 10 s
+      data timeout => "error -110 whilst initialising MMC card".
+      Fix: RK3588_EMMC_CAPAREG |= 1 << 22 (documented in
+      src/rk3588-sdhci.c).  Linux still picks ADMA2 over SDMA, and
+      QEMU now honors TRNS_DMA and runs its real ADMA2 engine
+      against guest memory.
+    - GUEST EVIDENCE after the fix: "mmc1: new high speed MMC card
+      at address 0001", "mmcblk1: mmc1:0001 QEMU!! 64.0 MiB",
+      " mmcblk1: p1" (MBR partition scan), EXT4 mounted r/w, hello.txt
+      content verified.  The eMMC disk is mmcblk1 (not mmcblk0):
+      the dw-mmc slot host (fe2c0000.mmc, SPI 203) binds first as
+      mmc0 ("dwmmc_rockchip ... Version ID is 270a", no card), so
+      initramfs/demo.c now discovers the eMMC by scanning
+      /dev/mmcblkN for MBR 0x55AA + partition type 0x83 instead of
+      hardcoding mmcblk0.
+    - Known minor issue (does not affect the demo or LINUX-OK): a
+      few minutes after boot the guest logs "mmc1: Card stuck being
+      busy! __mmc_poll_for_busy" (CMD13 poll after the raw-disk
+      reads in the demo); harmless but worth a look in a future pass.
     - Regressions at this state: U-Boot prompt=1 invalid=0; EDK2
       banner=2 invalid=0 (the removed emmc-sdhci stub does not affect
       the EDK2 no-card path).  LINUX-OK still prints in run-linux.
+    - EXIT EVIDENCE (2026-10-11, clean build after removing the
+      temporary RK3588_SDHCI_DEBUG write-hook logger):
+      serial log logs/p11-exit-2-serial.txt (timeout 70 boot with
+      the eMMC image attached): demo P11 block all PASS —
+      "[PASS] open eMMC disk / eMMC disk: /dev/mmcblk1",
+      "[PASS] MBR signature 0x55AA", "[PASS] MBR partition 1 type
+      0x83 (Linux)", "[PASS] open eMMC partition (partition scan)",
+      "[PASS] mount ext4 eMMC partition -> /mnt" (+ dmesg
+      "EXT4-fs (mmcblk1p1): mounted filesystem ... r/w"), "[PASS]
+      open /mnt/hello.txt", "hello.txt: eMMC rootfs test 0123456789",
+      "[PASS] hello.txt content", "LINUX-OK", zero [FAIL] lines.
+      Debugging traces kept: logs/p11-cmd1-trace.txt (sdbus_command/
+      response4/response16 proof of the card-side CMD1..CMD8 chain),
+      logs/p11-adma-trace.txt, logs/p11-dbg-qemu.txt (write-hook
+      logger with ier=0x0b/trnmod=0x12 at CMD8 — the smoking gun).
     - Deferred (unchanged): dwmshc IRQ emission for the Linux dw_mmc
-      path, ext4 mount demo PASS lines, exit evidence, appimage.
+      path (the dw-mmc slot host binds and enumerates as mmc0 today;
+      no card attached), stock-DTB items (CQE, SCMI, genpd, pinctrl).
 
 ## Rules of engagement
 - ./qemu tree: only qemu.patch application + symlink; regenerate patch via git diff.
@@ -1781,3 +1885,603 @@ P11 (user directive 2026-10-10, next step toward the unmodified-Armbian goal)
   superseded by P9's scanout shim + the HDMI chain). The user then
   directed P11 (DW-MMC/eMMC storage + CRU emulation) as the next step
   toward the unmodified Armbian image boot.
+- SCOPE update 2026-10-11: P11 is DONE (exit evidence in P11; root cause of
+  the eMMC -110 was the missing SDMA capability bit).  The user then
+  directed finishing the unmodified pre-kernel chain ("go for 1" = P10
+  Phases 2-3: stock atf-1, raw-load chain, IDMAC) — DONE the same day:
+  root cause of the post-`out` SPL silence was the DDR-training DQ test
+  clobbering the init-time-staged SPL at address 0; fixed by the
+  BootROM-resume staging (src/rk3588.c), and the full stock chain now
+  reaches the EDK2 front page and an interactive UEFI `Shell>` with
+  0 invalid accesses (exit evidence in P10 Phase 2/3).  Next toward the
+  unmodified Armbian image: stock-DTB boot items (SCMI, genpd, pinctrl,
+  eMMC HS200/HS400, CQE) and the Armbian image mechanics (real
+  multi-GB SD image attach, U-Boot boot.scr/extlinux read).
+- SCOPE update 2026-10-12: the user directed the stock-DTB boot items —
+  P13.  DONE for SCMI, genpd, pinctrl and PL330 (exit evidence in P13):
+  the UNMODIFIED in-tree rk3588s-orangepi-5.dtb boots Linux to LINUX-OK
+  with 0 invalid accesses.  Remaining from that directive: eMMC
+  HS200/HS400 + CQE (the eMMC node is disabled in the pure-mainline
+  DTB; needs an Armbian-derived DTB or the real image) and the Armbian
+  image mechanics.
+
+## P13: Stock-DTB Linux boot (rk3588s-orangepi-5.dtb)
+  Goal (user directive 2026-10-12, "keep moving towards stock-dtb boot
+  devices such as SCMI, genpd, pinctrl, eMMC HS200/HS400, CQE"): boot the
+  UNMODIFIED in-tree mainline DTB — the same DTB the Armbian kernel
+  derives its board DTB from — instead of our hand-written dts/rk3588-qemu.dts.
+  STATUS: SCMI + genpd + pinctrl + pl330 DONE with exit evidence; eMMC
+  HS200/HS400 + CQE remain (the eMMC node is status="disabled" in the pure
+  mainline DTB; Armbian's own DTB enables it — deferred to the Armbian
+  image work).  New model parts this session:
+  1. src/rk3588-timer.c (NEW device): the stock DTB's timer@feae0000
+     (rk3288-style down-counter) drives rk_timer (Linux
+     drivers/clocksource/timer-rockchip.c) at time_init; the unmodelled
+     window aborted PID 0 at 0.006 s ("rk_timer_probe+0x188, ESR
+     0x96000050" — invisible without earlycon; found via exec-trace =
+     arch_timer/__delay loop + vpanic PCs, then an earlycon-injected
+     DEBUG COPY of the DTB, /tmp/opencode/p12-dbg.dtb, NOT part of any
+     evidence run).  Model: 0x20 register file, count computed from the
+     QEMU virtual clock on CURRENT_VALUE reads (no ptimer at 24 MHz),
+     one-shot + free-run, INT_STATUS W1C, IRQ on GIC SPI 289
+     (rk3588.c: rk3588_create_timer; note the model's GIC gpio index
+     convention: index == DTB SPI cell, dist intid = index + 32).
+  2. PL330 DMACs (fea10000/fea30000/fed10000): unmodelled, the AMBA
+     periph-ID read aborted PID 1 (amba_read_periphid in
+     of_platform_populate).  QEMU's in-tree pl330 model instantiated 3x
+     (rk3588.c rk3588_create_dmacs, num_events=1 matching the two DTB
+     IRQs, Kconfig "select PL330") PLUS register-tail stubs
+     (rk3588-stubs.c dmac{0,1,2}-tail, [base+0x1000,+0x4000)) because
+     this kernel's amba_read_periphid reads pid/cid at the END of the
+     DTB reg window (base + size - 0x20/-0x10), not at +0xfe0; the
+     tails carry the model's ID bytes (pid 0x241330 -> 0x41330 under the
+     driver's 0x000fffff mask, cid 0xB105F00D).  Result: "dma-pl330
+     ...: Loaded driver for PL330 DMAC-241330, DBUFF-256x8bytes
+     Num_Chans-8 Num_Peri-32 Num_Events-1" x3 — the real engine model
+     is live.
+  3. PMU read hook (rk_stub_pmu_read): rockchip-pm-domain
+     (drivers/pmdomain/rockchip/pm-domains.c, syscon fd8d8000) polled
+     chain/mem/repair status forever (~5 s per deferred-probe retry;
+     boot stuck minutes in genpd loops).  The hook now answers
+     +0x180 status=0 / +0x1f0 chain=0xffffffff / +0x1f8 mem=0 /
+     +0x290 repair=0xffffffff (offsets relative to fd8d0000): every
+     domain reads "powered, chain up" — power_on short-circuits,
+     power_off fails its 10 ms poll and the domain stays on.
+     BONUS: BL31's own pmu init "pmu_power_domain_reset_mem: NN chain
+     up time out" warnings (every boot since the beginning) are GONE.
+     The old SMP blocker is unchanged (CPU_ON still fails 8x, kernel
+     continues 1 CPU; not investigated this session).
+  4. QoS register files (qos-a/b/c/d stub spans fdf35000+0xe000,
+     fdf60000+0x8000, fdf70000/80000+0x3000): rockchip_pd_power
+     save_qos() reads PRI/MODE/BW/SAT/EXT of every domain's QoS windows
+     on each power transition — one unmapped read killed init in
+     regmap_mmio_read32le.
+  5. Graceful-fail stubs for the rest of the enabled stock-DTB windows:
+     smmu-v3 fc900000 (probe reads 0 -> "no translation support!"),
+     gpu fb000000, npu fdab0000+0x30000, codecs fdb50000+0x60000,
+     vdec fdc38000+0xd000, av1 fdc70000, av1-iommu fdca0000,
+     vop-iommu fdd97000, i2s-tdm fddf0000/fe480000, tsadc fec00000,
+     wdt feaf0000, dfi fe060000.  Panthor/snd/thermal are =m and never
+     probe during the initramfs boot.
+  WORKING SCMI (no new code!): the DTB's arm,scmi-smc conduit
+  (SMC 0x82000010, shmem 0x10f000) is served by our own TF-A's
+  plat/rockchip/common/scmi (rk3588_clk.c cpul/cpub/dsu tables; the
+  CRU PLL-lock stubs from P11 make its set_rate paths pass).  Guest
+  evidence: "arm-scmi arm-scmi.1.auto: Using scmi_smc_transport /
+  SCMI Protocol v2.0 'rockchip:' Firmware version 0x0 / Enabling SCMI
+  Quirk [quirk_clock_rates_triplet_out_of_spec]" — the stock sdmmc
+  biu/ciu SCMI clocks resolve.
+  pinctrl: "rockchip-gpio fd8a0000.gpio: probed /pinctrl/gpio@fd8a0000"
+  (+ fec2/3/4/50000) — the GPIO/PMU stub windows from earlier phases
+  already satisfy the bank drivers.
+  Makefile: images/rk3588s-orangepi-5-stock.dtb (padded copy of the
+  in-tree dtb) + run-linux-stock target (290 s; the stock DTB boot is
+  slow: ttyS2 at ~51 s, /init at ~147 s — deferred-probe backoffs).
+  sfc note: the fe2b0000 window is a 0x1000 "sdhci"-named stub;
+  CONFIG_SPI_ROCKCHIP_SFC is =m so it never probed.
+  EXIT EVIDENCE (2026-10-12): make run-linux-stock (PRISTINE unmodified
+  in-tree rk3588s-orangepi-5.dtb, no earlycon, no DTB edit):
+  logs/p12-stockdtb-exit.txt — "Starting kernel" -> "Machine model:
+  Xunlong Orange Pi 5" -> "ttyS2 at MMIO 0xfeb50000 ... is a 16550A" ->
+  "SCMI Protocol v2.0 'rockchip:'" -> "Loaded driver for PL330
+  DMAC-241330" x3 -> "Run /init as init process" -> "[PASS] ..." demo
+  lines -> "LINUX-OK"; display chain also binds ("bound fdd90000.vop /
+  bound fde80000.hdmi / [drm] Initialized rockchip 1.0.0"); DRM fbcon
+  240x67.  Invalid accesses: 0 (logs/p12-stockdtb-exit-int.log).  The
+  demo's eMMC block [FAIL]s 4x are EXPECTED: sdhci@fe2e0000 is
+  status="disabled" in the pure-mainline OPi5 DTB (Armbian's DTB
+  enables it; see deferred items).  Debug-run evidence with earlycon:
+  logs/p12-stockdtb-dbg.txt (SCMI + genpd + PL330 lines).
+  Regressions at this state: make run-linux (custom DTB) LINUX-OK with
+  the eMMC PASS block intact; make regress U-Boot prompt=1 invalid=0,
+  EDK2 banner=2 invalid=0; make sd-own-bl31 chain intact (our BL31
+  NOTICE after warm reset); stock pre-kernel chain still reaches
+  "UEFI firmware (version v1.1...)" (logs/p12-stockchain run);
+  appimage rebuilt + squashfs-root/AppRun smoke green with the STOCK
+  DTB boot (logs/p12-appimage-stockdtb.txt: ttyS2 + LINUX-OK).
+  DEFERRED (unchanged items + new ones): eMMC HS200/HS400 + CQE under
+  a stock-derived DTB with the node enabled (Armbian image DTB;
+  needs DLL/tuning + cqhci model work in the sdhci wrapper), SMP
+  (PSCI CPU_ON still fails; PMU hook did not change it), real Armbian
+  image mechanics (multi-GB SD attach, boot.scr/extlinux), cpufreq-dt
+  deferred probe, ITS nodes (fe640000/fe660000 unmodelled — the kernel
+  did not touch them this boot), "Adding module '' to sysfs failed"
+  WARN (kobject, harmless).
+
+## P13b: eMMC HS200/HS400 + CQE (dwcmshc, stock DTB with eMMC node enabled)
+  Goal (user directive 2026-10-12 "next: eMMC HS200/HS400 + CQE"): exercise
+  the dwcmshc eMMC at fe2e0000 with the DT node enabled (the pure-mainline
+  node ships status="disabled"; Armbian's DTB enables it - our derived DTB
+  flips only status to "okay"), driving HS200 tuning, the DLL block, HS400,
+  and the CQHCI command queue.
+  STATUS: CQE DONE with exit evidence (eMMC demo block 35 PASS / 0 FAIL over
+  the CQHCI doorbell path, 0 invalid accesses).  HS200/HS400 model parts are
+  in place but NOT exercised by this card (see below).  SMP-idle warm-reset
+  bug found + fixed on the way (see 3).
+  New model parts this session (src/rk3588-sdhci.c unless noted):
+  1. CAPAREG: + SDR50|SDR104 in BUS_SPEED (bits 32-33) - QEMU's checker
+     masks (not rejects) them; no UHS-II/64-bit (keeps CQHCI descriptors
+     8-byte/32-bit-ADMA2).
+  2. CQHCI engine (vendor area 2 @ +0x540, overlaps EMMC_ATCTRL; plain
+     storage underneath): synchronous doorbell model.  TDBR write executes
+     each tagged task via the inner sd-bus immediately: DCMD (slot 31) =
+     any command w/ arg at desc+4; data task = CMD23(SET_BLOCK_COUNT) +
+     CMD18/25(READ/WRITE_MULTIPLE) + data through the per-tag transfer
+     descriptor table (link desc at +8/+12 -> 8-byte entries: [31:16] len,
+     bit[1] END, [+4] address) + CMD12.  Completion: CQ_IS TCC + TCN bits +
+     OR bit 14 (SDHCI_INT_CQE, "error interrupt" per sdhci spec but Linux
+     dwcmshc routes it as CQE) into the inner sdhci INT_STATUS and
+     recompute the IRQ line = the dwcmshc_cqe_irq_handler ->
+     sdhci_cqe_irq -> cqhci_irq chain reads back out.  CQ_VER answers 5.10
+     ("mmc1: CQHCI version 5.10" + "mmc1: Command Queue Engine enabled").
+     CARD LBA addressing: small eMMC images (<= 2GiB, kernel mmc.c rule:
+     EXT_CSD SEC_CNT > 2GiB/512 => sector addressing) are byte-addressed -
+     the kernel pre-multiplies LBA x 512 and the card expects byte
+     addresses; the engine probes EXT_CSD SEC_CNT (CMD8) once (lba_shift
+     9 vs 0) and converts the task descriptor's block address before
+     CMD18/25 (without this the ext4 mount read "Can't find ext4
+     filesystem": reads served file bytes 2050-3073 instead of sector
+     2050; found by comparing the traced card CMD18 args 0x100400 (no-CQE
+     run, byte-addr) vs 0x802 (CQ run, raw LBA)).
+  3. STOCK-DTB CPU-idle warm-reset bug (found via int-trace: EL3 UNDEF at
+     TF-A 0x5956c = cortex_a76_core_pwr_dwn's CPUECTLR_EL3 read
+     (mrs s3_0_c15_c2_7), UNDEF under TCG): the stock DTB's cpu-idle-states
+     drive the kernel to PSCI CPU_SUSPEND -> TF-A deep power-down -> UNDEF
+     -> TF-A death -> warm reset (silent, mid-boot, ~150 s; our custom
+     dts/rk3588-qemu.dts never had idle states which is why P11 boots were
+     stable).  Fix: the derived eMMC DTB drops the cpu-idle-states
+     reference from each /cpus/cpu@* (fdtput -d loop in the Makefile rule).
+  4. HS200/HS400/DLL model parts (IN PLACE, NOT YET EXERCISED by this
+     card): DLL_STATUS0 overlay (+0x840, answers LOCKED=1 TIMEOUT=0 for
+     dwcmshc_rk35xx_set_clock's 500 ms poll); QEMU tuning path fixed
+     (qemu.patch): sdhci_read_block_from_card now consumes the block from
+     the card in EXECUTE_TUNING mode too (the driver never reads the
+     tuning pattern via the data port - a skipped read stranded the card
+     in sendingdata and every later command died, silent boot stall) and
+     raises Buffer Read Ready on the tuning cycle (sdhci_send_tuning's
+     completion signal - without it every tuning window times out);
+     eMMC CMD21 handler serving the 128-byte (8-bit) HS200 pattern (the
+     sd_tuning_block_pattern4 repeated twice).  WHY NOT EXERCISED: the
+     stock DTB's hs400 props + our capareg SDR104 admit HS200, but the
+     CARD's EXT_CSD CARD_TYPE (196) = 0b11 (HS26|HS52 only) caps
+     mmc_avail_type at HS -> Linux logs "new high speed MMC card" and
+     never enters the >52 MHz clock path (no DLL poll, no tuning, no
+     HS400).  NEXT: advertise HS200/HS400(+strobe) on the card's EXT_CSD
+     (CARD_TYPE bits + STROBE_SUPPORT) in qemu.patch, then the whole
+     HS200 tuning -> HS400 switch chain becomes exercisable end-to-end.
+  5. qemu.patch grew (hw/sd/sd.c, hw/sd/sdhci.c, hw/sd/sdmmc-internal.h):
+     - sd.c: EXT_CSD_CMDQ_{SUPPORT,DEPTH} defines; emmc ext_csd sets
+       CMDQ_SUPPORT=1 / CMDQ_DEPTH=31 (queue depth 32; the kernel only
+       decodes them at EXT_CSD_REV >= 8 so REV bumped 5 -> 8);
+       eMMC proto table [21] = emmc_cmd_SEND_TUNING_BLOCK (CMD21).
+     - sdmmc-internal.h: EXT_CSD_CMDQ_DEPTH/SUPPORT offsets 307/308.
+     - sdhci.c: tuning-block consume + RBUFRDY on the tuning cycle (4).
+     (regenerate: git -C qemu diff -- hw/arm/Kconfig hw/arm/meson.build
+      hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdmmc-internal.h > qemu.patch)
+  6. Makefile: images/rk3588s-orangepi-5-emmc.dtb rule (stock copy +
+     status=okay + cpu-idle-states drop) + run-linux-stock target
+     timeout 290 s + run-linux-emmc target (grep prints
+     LINUX-OK/mmc/CQHCI/PASS/FAIL).
+  EXIT EVIDENCE (2026-10-12): make run-linux-emmc (stock DTB, eMMC node
+  enabled): logs/p13-emmc-cqe-exit.txt - "mmc1: CQHCI version 5.10" ->
+  "mmc1: Command Queue Engine enabled" -> eMMC demo block over the CQE
+  doorbell path: [PASS] MBR signature / partition scan / mount ext4 ->
+  /mnt / hello.txt content ... 35 [PASS] / 0 [FAIL], "LINUX-OK", 0
+  invalid accesses (logs/p13-emmc-cqe-exit-int.log).  Regressions at this
+  state: make run-linux (custom DTB) LINUX-OK; make regress U-Boot
+  prompt=1 invalid=0, EDK2 banner=2 invalid=0.
+  Remaining in this milestone: advertise HS200/HS400 on the emmc card
+  (EXT_CSD CARD_TYPE + strobe) to exercise the DLL/tuning/HS400 chain
+  (model parts already in place, see 4); SMP (PSCI CPU_ON still fails
+  8x, boots 1 CPU); "Card stuck being busy" CMD13 polls on some R1B
+  switches (non-fatal); Armbian image mechanics next.
+
+## P14: Armbian 26.8.1 OPi5 GNOME image bring-up (in progress)
+  Goal (user): boot the unmodified Armbian image
+  (Armbian_26.8.1_Orangepi5_resolute_current_6.18.43_gnome_desktop.img.xz,
+  6.1 GB, GPT, single rootfs ext4 @sector 32768; boot area carries
+  idbloader@0x8000 + u-boot.itb@8MiB; kernel 6.18.43-current-rockchip64
+  with 8250_DW/SDHCI_OF_DWCMSHC/CQHCI/EXT4 built in, no SCMI) to a basic
+  GNOME desktop (llvmpipe) on the QEMU model.  Artifacts extracted to
+  images/armbian/ (vmlinuz, initrd.img, vendor rk3588s-orangepi-5.dtb);
+  derived boot DTB = vendor copy with /mmc@fe2e0000 status=okay (vendor
+  DTB ships it disabled like mainline; Armbian enables it at boot via
+  overlays) + cpu-idle-states deleted (P13's TF-A deep-idle crash).
+  Boot method: same manual-load flow as run-linux-emmc but the Armbian
+  Image (35 MB) + vendor DTB; root=/dev/mmcblk1p1 (root=UUID= needs an
+  initramfs - the kernel only resolves PARTUUID/dev without one); U-Boot
+  autoboot is interrupted over serial (BOOTDELAY=2, stream CR for ~20 s,
+  then 'setenv bootargs ...; booti 0x02000000 - 0x0a100000').
+  STATUS: systemd boots to graphical.target + serial root auto-login,
+  0 flip_done errors - but the rootfs turns read-only mid-boot (eMMC I/O
+  errors under the 6.18 kernel's non-CQ ADMA path, root cause not yet
+  fixed - see 3).  Next move: the eMMC data-transfer state bug (4).
+
+  1. VOP flip_done root cause + fix (DONE, exit evidence
+  logs/p14-vop-iommu-fix.txt): the chain was rk_iommu (vop_mmu
+  fdd97e00.iommu, the VOP's runtime-PM supplier via its iommus
+  property) failing its runtime resume on the storage stub
+  (enable_paging polls MMU_STATUS PAGING_ENABLED forever -> -110) ->
+  rpm_get_suppliers() propagates -EINVAL to every later
+  pm_runtime_resume_and_get(vop2) ("failed to get pm runtime: -22") ->
+  runtime_error set -> vop2_isr() refuses to run
+  (pm_runtime_get_if_in_use() == 0) -> FS interrupts never ACKed ->
+  every atomic commit dies with "flip_done timed out" (fbcon stalls, GDM
+  can never paint).  Diagnosed by instrumenting the kernel runtime PM
+  core (rpm_callback + genpd_runtime_resume dev_err prints, since
+  REVERTED - tree is pristine again) to see the -EINVAL propagate from
+  the supplier.  Fix: NEW behavioral iommu model src/rk3588-iommu.c(h)
+  registered for both vop_mmu windows (0xfdd97e00/0xfdd97f00; the old
+  0xfdd97000+0x1000 storage stub now covers only the 0xe00-byte gap):
+  DTE_ADDR storage (FORCE_RESET self-clears to satisfy is_reset_done),
+  STATUS computed (PAGING bit0 / STALL bit2 / IDLE bit3 / REPLAY bit4 /
+  STALL_NOT_ACTIVE bit31), COMMAND executes
+  ENABLE/DISABLE_PAGING+STALL, ZAP_CACHE/PAGE_FAULT_DONE no-ops,
+  FORCE_RESET clears.  Translation is NOT modeled (device DMA behind it
+  must be identity - iommu.passthrough=1 - or tolerate garbage; VOP2
+  scanout reads framebuffers by physical address, fine headless).
+  Also added to qemu/hw/arm/meson.build (qemu.patch regenerated).
+  Result: 0 flip_done/vblank/pm-runtime errors, demo 35 PASS / 0 FAIL,
+  FS interrupts ACK (vop ISR runs; RK3588_VOP_DEBUG=1 env-gated prints
+  added to rk3588-vop2.c kept for future debug).
+
+  2. PMU idle-ack mirroring (DONE): rk3588-stubs.c PMU syscon hook now
+  shadows writes to PMU_BUS_IDLE_REQ0/1 (0x810c/0x8110, hiword or plain
+  regmap semantics) and mirrors them into IDLE_ACK (0x8118) / PMU2_IDLE
+  (0x8120/0x8124) reads - same bit for low-word requests, +16 for
+  high-word (this also subsumes the old TPL DDR force-OR: SFTCON1 bits
+  12-15 -> ack bits 28-31).  Kills every "failed to get ack on domain"
+  retry loop (rockchip-pm-domains polls these on each idle request) and
+  cut guest boot time to Run /init from ~143 s to ~87 s.  power_off
+  still reports failure at the status poll (10 ms, harmless - domains
+  just stay on).
+
+  3. Armbian boot state (evidence logs/p14-armbian-graphical.txt):
+  kernel 6.18.43 -> "new HS400 Enhanced strobe MMC card" (vendor DTB,
+  NO CQE - the vendor DTB has no supports-cqe, so this boot exercises
+  the plain sdhci ADMA path, NOT our CQ engine) -> ext4 recovery
+  completes + mounts r/w -> systemd 259.5 -> first-boot housekeeping ->
+  serial-getty root auto-login -> "[ OK ] Reached target
+  graphical.target" with 0 flip_done errors.  systemd-logind FAILS:
+  "Failed to set up special execution directory in /var/lib:
+  Read-only file system" -> GDM never starts.  Root cause of the ro
+  remount: eMMC I/O errors -> ext4 "Detected aborted journal" ->
+  "Remounting filesystem read-only".
+
+  4. eMMC data-transfer state bug (ROOT CAUSE FOUND + FIXED, exit
+  evidence logs/p14-armbian-cleanboot.txt = Armbian boot14): the vendor
+  6.18 dwcmshc driver issues multi-block reads/writes with the Auto-CMD23
+  transfer-mode bit set (trnmod 0x3b/0x2b) and the sbc argument in the
+  ARGUMENT2 register (offset 0x00) - the CONTROLLER is expected to send
+  CMD23 (SET_BLOCK_COUNT) before CMD18/CMD25 so the card terminates the
+  transfer by itself.  QEMU's generic sdhci never implemented
+  Auto-CMD23: (a) SDHC_TRNMOD_MASK (hw/sd/sdhci-internal.h) was 0x37,
+  which STRIPS the ACMD23 bit (0x08) on every trnmod write, and (b) no
+  CMD23 was sent.  Result: open-ended CMD18 left the card stuck in
+  sendingdata after the host's ADMA engine finished (block-count
+  termination is host-side only), the next command hit 'CMDxx in a
+  wrong state: sendingdata' -> Command Timeout -> I/O error -> ext4
+  'Detected aborted journal' -> 'Remounting filesystem read-only' ->
+  systemd-logind 'Failed to set up special execution directory in
+  /var/lib: Read-only file system' -> GDM never started.  (Every other
+  request went through the driver's CMD13+CMD12 error recovery - hence
+  thousands of wrong-state lines but only ~7 logged I/O errors.)
+  FIX (2 qemu.patch hunks, in addition to the earlier ones):
+    - hw/sd/sdhci-internal.h: SDHC_TRNMOD_MASK 0x0037 -> 0x003F so the
+      ACMD23 bit survives the trnmod write (ACMD12 0x04 was already
+      kept - QEMU implements Auto-CMD12 in sdhci_end_transfer).
+    - hw/sd/sdhci.c sdhci_send_command(): when trnmod has ACMD23 +
+      MULTI + cmdreg DATA_PRESENT, send CMD23 (arg = s->blkcnt) to the
+      card before the data command, mirroring what real hardware does
+      (matches the sbc arg the driver programs into ARGUMENT2/0x00).
+  NOTE: -trace and -D interact: '-trace enable=X,file=' or '-D' can
+  hijack/drop trace output (use separate -trace flags, no file=, and
+  no -D in the same run when traces must land in the console log).
+  RESULT (boot14): 0 I/O errors, 0 wrong-state, journal never aborted,
+  rootfs stayed r/w, systemd-logind STARTED, root serial auto-login at
+  260s guest.  Regression on 7.2.9: run-linux-emmc 35 PASS / 0 FAIL /
+  LINUX-OK / HS400ES / 'Command Queue Engine enabled' (checked twice).
+  CAVEAT: CQE-enable on 7.2.9 was seen failing in 2 of 4 runs - a
+  timing-flaky, pre-existing (PMU-mirror-speed-exposed) failure with
+  no error print (silently missing 'Command Queue Engine enabled';
+  card still registers): worth a dedicated pass later.
+  Boot14 console went silent after ~366s guest while the guest kept
+  executing (int log growing) - presumed GDM/llvmpipe churning; GDM
+  state NOT yet verified (next step).
+
+  5. Armbian desktop bring-up (boot22, evidence
+  logs/p14-armbian-diag.txt + logs/p14-armbian-gdm.txt): driven by a
+  marker-driven python serial driver (stdin=PIPE; see
+  /tmp/opencode/armbian-driver*.py, armbian-screendump.py) because
+  blind-sleep pipelines are fragile: U-Boot countdown must be hit by
+  CR flood from t+0.5s (4s late = missed autoboot = empty bootargs =
+  VFS panic); agetty restarts eat the first login attempts (retry
+  loop); -serial mon:stdio input works via PIPE.
+    - boot21 diagnostics as root: only 1 failed unit
+      (bluetooth-hciattach, BT firmware, irrelevant); logind OK;
+      DRM UP: /sys/class/drm/card0 + card0-HDMI-A-1 connector,
+      rockchipdrm module loaded, /dev/dri/card0, /proc/fb lists
+      'rockchipdrmfb', Xwayland sockets appear later.
+    - /etc/systemd/system/display-manager.service was ABSENT: the
+      image ships gdm.service INSTALLED but DISABLED - that is why no
+      GDM ever ran.  Root login needed for the fix; the first-boot
+      serial autologin was already consumed by boot14 (root had no
+      usable password -> 'Login incorrect'), so booted once with
+      init=/bin/sh via our controlled bootargs and ran passwd -d root
+      (synced; empty root password persists in the image).
+    - boot22: 'systemctl enable gdm' (symlink display-manager.service
+      -> gdm.service, persistent) + 'systemctl start gdm' -> rc 0;
+      loginctl session c1: gdm-greeter on seat0/tty1, and the full
+      GNOME greeter stack runs: gdm-wayland-session gnome-session on
+      tty1, /usr/bin/gnome-shell --mode=gdm (Wayland + llvmpipe,
+      ~12% CPU, stable - no crash-respawn loops in the journal),
+      pipewire/wireplumber, dbus, gnome-keyring, at-spi,
+      Xwayland instances (X1024/X1025).  /dev/fb0 (rockchipdrmfb
+      legacy fbcon) stays frozen as expected: mutter renders through
+      DRM planes, not fbcon.  Pixel-level proof via QEMU monitor
+      'screendump' (src/rk3588-display.c has a real
+      qemu_graphic_console + per-frame repaint) pending in boot23.
+    - Remaining known-harmless noise: rockchip-pm-domain 'failed to
+      set domain X off' every few seconds (fast-fail power-off path;
+      domains stay on) and rk_iommu FORCE_RESET timeouts for the
+      codec iommus (storage stubs; only vop_mmu got the behavioral
+      model) - these dominate the -p err journal and some CPU.
+
+  5b. Greeter pixel-level verification (DONE, faster path): booting with
+  systemd.unit=multi-user.target + serial login reaches a testable
+  state in ~10 min instead of 40+ (no GDM on 1 TCG vCPU).
+  boot24 (logs/p14-armbian-mu-display.txt boot section): fbcon lives
+  on Cluster0-win0/video_port0, XR24 1920x1080 pitch 7680, GEM
+  start=00000000 - i.e. YRGB_MST=0 (rk3588 DRAM is based at 0x0 and
+  the kernel's CMA sits at the very bottom).  src/rk3588-display.c
+  gfx_update rejected addr==0 as 'not programmed' -> permanent
+  640x480 placeholder (the black greeter screendumps).
+  FIX: allow addr==0 (guard on ctl/vir/act only).
+  boot25 (evidence logs/p14-display-fbcon-1920.ppm): screendumps now
+  1920x1080 real scanout with structured fbcon content - kernel
+  text rows, orange/red Armbian splash band (ff8000/ff0000, correct
+  channel order), white text; idle vs fill dumps differ (cursor).
+  /dev/fb0 noise fill gets restored by the fbdev shadow-buffer
+  deferred-io flush within ~1s (modern fbdev emulation), which is
+  why the fill doesn't persist - expected.  Display pixel path
+  (VOP2 window regs -> guest RAM -> pixman surface -> screendump)
+  is PROVEN end-to-end; mutter/GDM commits the same Cluster0 regs,
+  so the greeter will scan out through the same code.  modetest is
+  not installed in the image (checked boot24).
+
+  5c. Greeter presentation failure (CLOSED as guest-userspace limitation,
+  boots 29-32): the kernel side is FULLY healthy - VOP2 vblank irq
+  registered ('GICv3 188 Level fdd97e00.iommu, fdd90000.vop' counting
+  at ~60Hz while enabled; earlier 'no vop line' snapshots were taken
+  before the ~208s component bind - red herring), flip-event gating
+  semantics match the model (mainline rockchip_drm_vop2.c vop2_isr;
+  module extracted+disassembled, logs/kmod/rockchipdrm.ko:
+  devm_request_threaded_irq flags 0x200080).  With drm.debug=0x0c
+  (boot30) there are ZERO atomic commits after the 20:13 fbcon
+  modeset - mutter fails BEFORE KMS: its GBM surface swap dies
+  (EGL_BAD_ALLOC 3003 'Failed to query buffer age') ->
+  gbm_surface_lock_front_buffer has no free buffer -> greeter
+  error-loops forever (gnome-shell stays alive 10+ min, logs
+  'Failed to lock front buffer' 1/sec, no flip ever submitted).
+  Root cause class: the model has NO GPU -> no
+  /dev/dri/renderD128 -> mutter4x+llvmpipe via mesa kms_swrast on
+  card0 cannot complete its GBM swap in this GEM environment.
+  X11 fallback UNAVAILABLE: xserver-xorg is NOT installed in the
+  image (Armbian GNOME is Wayland-only) - boot32 confirmed via
+  'ls /usr/libexec/Xorg /usr/bin/Xorg' (empty) even after inserting
+  WaylandEnable=false into /etc/gdm3/custom.conf (NOTE: the image
+  is now dirty with that insert).
+  Deliverable status: kernel DRM pipeline (modeset, windows,
+  vblank/flip IRQs, fbcon 1920x1080 scanout with real content) is
+  PROVEN end-to-end (see 5b); GDM + greeter processes run; pixel
+  presentation by the greeter is NOT achievable without either a
+  GPU/render-device model (panthor - a large separate project) or
+  guest-side mesa debugging (proposed probe: python ctypes EGL
+  driver replicating mutter's gbm_surface+SwapBuffers path on
+  tty1 with GDM stopped, to identify the exact failing ioctl/EGL
+  call - cheap to run, but likely hits the same fundamental
+  render-node absence).
+
+  5d. KDE Plasma image greeter via X11 (DONE, boot1): the user supplied
+  Armbian_26.8.1_Orangepi5_resolute_current_6.18.43_kde-plasma_desktop
+  .img.xz.  Unlike the GNOME image, KDE ships xserver-xorg-core 21.1.22
+  (/usr/bin/Xorg wrapper -> /usr/lib/xorg/Xorg) - the X11 fallback
+  mutter needed.  Image prep: init=/bin/sh boot + 'passwd -d root'
+  + 'rm -f /root/.not_logged_in_yet' (kde-prep.py; challenge-response
+  prompt detection needed - naive '# ' match false-positives on
+  U-Boot output).  Boot driver kde-boot1.py: multi-user target, login
+  root/empty, forced SDDM X11 via /etc/sddm.conf.d/99-force-x11.conf
+  '[General] DisplayServer=x11' (sddm 0.21.0), systemctl start sddm.
+  RESULT (logs/p15-kde-greeter-x11-a/b.ppm): Xorg on tty2
+  (/usr/lib/xorg/Xorg), sddm-greeter-qt6 running (96% CPU, llvmpipe),
+  /tmp/.X11-unix/X0, and the KERNEL side proves full KMS: dri state
+  video_port0 crtc fb=85 'allocated by Xorg' 1920x1080 XR24 refcount=2
+  - i.e. Xorg+modesetting DDX successfully does atomic commits through
+  our VOP2 model (the GBM wall that killed mutter's Wayland greeter is
+  bypassed by the classic X path).  Screendumps are 1920x1080 greeter
+  UI (SDDM breeze: structured text rows, panel bands; colors beyond
+  the fbcon/splash palette: 202000/000031/79e002/white) and the two
+  dumps 60s apart DIFFER (live animation).  Remaining gap: full Plasma
+  SESSION would need kwin_wayland -> same GBM/render-node limitation
+  (no kwin_x11, /usr/share/xsessions is EMPTY - Plasma 6 ships no X11
+  session); greeter pixel goal is ACHIEVED.
+  Driver/prep scripts: /tmp/opencode/kde-prep.py, kde-boot1.py (image
+  now dirty: root pw empty, sddm.conf.d/99-force-x11.conf present).
+
+  5e. virtio-gpu at the Mali slot (IN PROGRESS): goal = render node +
+  mature KMS for the guest (Plasma has no X11 session; kwin_wayland needs
+  GBM+render node; host container has NO /dev/dri and no kernel modules,
+  so virgl host GL is unavailable - plain virtio-gpu only).
+  - QEMU: rebuilt with libvirglrenderer-dev (virtio-gpu-gl-device now
+    exists but requires display_opengl -> -display egl-headless -> needs
+    a HOST DRM render node for GBM init -> dead end in this container;
+    revisit via Xvfb+SDL or a surfaceless patch only if llvmpipe is
+    insufficient).  Machine: src/rk3588.c gained rk3588_create_virtio_gpu()
+    + -machine vgpu=on (default off): virtio-mmio transport at
+    0xfb000000, force-legacy=false, GIC SPI 92, overlap priority 1
+    (wins over the 'gpu' stub); the GPU itself comes from CLI
+    (-device virtio-gpu-device[,id=vgpu][,xres=,yres=]) and
+    qbus_find_recursive attaches it to the transport (arm-virt pattern).
+  - DTB: images/armbian/rk3588s-orangepi-5-vgpu-boot.dtb = armbian-boot
+    dts with gpu@fb000000 converted to virtio,mmio (reg 0x200,
+    interrupts <0 92 4 0> single, dma-coherent; kept #cooling-cells +
+    phandle 0xf0 for thermal-zone consistency; NOTE devices live at DT
+    ROOT in this flattened Armbian tree, not /soc).  dtc roundtrip from
+    the decompiled -boot dts (source /tmp/opencode/armbian-boot.dts).
+  - Guest kernel 6.18: CONFIG_VIRTIO_MMIO=y, virtio-gpu.ko +
+    virtio_dma_buf.ko present; virtio_gpu driver has unconditional
+    DRIVER_RENDER -> renderD128 exists even without virgl; dumb_create +
+    shmem GEM -> GBM + dma-buf export (PRIME) work; no contexts without
+    virgl (has_virgl_3d=false).
+  - boot2 (kde-vgpu.py): virtio-gpu probed at fb000000.gpu, became
+    minor 0 = card0 + fbcon provider (registers at ~98s, BEFORE
+    rockchipdrm's ~208s deferred bind -> rockchip = card1 now; numbering
+    inverts the intended PRIME topology).  sddm with
+    DisplayServer=wayland SILENTLY started the x11-user greeter anyway
+    (no kwin lines, no fallback message in the grepped journal; journal
+    tail was flooded by apparmor-audit lines matching 'sddm' via the
+    profile name).  Xorg chose the ROCKCHIP card (greeter 'Adding view
+    for HDMI-1 1920x1080') -> same X11 greeter as 5d on our VOP2.
+    NEW model issue: one 'rockchip-drm: wait for vp0 dsp_hold timeout'
+    ~10 min into the greeter (suspect X idle/DPMS blank triggering a
+    CRTC path our model doesn't ack; non-fatal, kernel timed out and
+    continued).
+  - boot3 (kde-vgpu3.py, DONE - logs/p15-kde-plasma-wayland*.ppm/.txt):
+    created user opi, sddm [Autologin] opi + Session=plasma, and the
+    FULL PLASMA WAYLAND SESSION CAME UP: loginctl session opi seat0
+    tty1, startplasma-wayland -> kwin_wayland --xwayland (30+ min
+    stable, 8.5% CPU) + plasmashell (617MB, actively rendering) +
+    Xwayland (X0) + pipewire.  /dev/dri: card0=virtio card1=rockchip
+    renderD128=virtio.  PIXELS: the DEFAULT screendump (= VOP2
+    console; virtio console 'vgpu' is BLACK, its dri/0 crtc-0
+    active=0) shows a RICH RENDERED DESKTOP - 148,390 unique colors
+    (fbcon/splash era had ~10), layered bands/icons/panels in ASCII
+    preview, and dumps 2 min apart differ in 379 scattered pixels
+    (live clock/cursor/animation) -> kwin presents through the ROCKCHIP
+    card (VOP2) with the virtio device as render-node peer; rockchip
+    dri/1 crtc section was truncated in capture (head -45 cut at
+    planes) - boot4 (kde-vgpu4.py) re-captures: kwin
+    supportInformation via session dbus, dri/1 crtc/fb 'allocated
+    by', VOP2 Cluster0 regs via monitor xp, 3 screendumps 90s apart.
+  - boot4 (kde-vgpu4.py, DONE - logs/p15-kde-plasma-wayland-live{1,3}.ppm,
+    p15-kde-plasma-vop2regs.txt): final evidence pass.  Three dumps 90s
+    apart: 213,314 unique colors, 1,267 pixels change between dump1 and
+    dump3 (live clock/cursor) on the DEFAULT console; the 'vgpu' console
+    stays black -> default console = our VOP2 display.  Monitor xp of
+    VOP2 regs at capture time: Cluster0 CTRL0=0x4000 (window-disable
+    pending, rb_swap set), YRGB_MST=0x017d9000, WIN_VIR=0x780 (pitch
+    7680), ACT_INFO=0x0437077f (1920x1080) - kwin's scanout buffer,
+    validly programmed; dri/1 state read moments earlier showed
+    video_port0 enable=0 active=0 plane_mask=0 (kernel-side DPMS blank
+    from 25 min idle - the rich live dumps before AND after mean our
+    display kept scanning an enabled window (likely ESmart2, kwin's
+    plane assignment differs from fbcon's Cluster0; only Cluster0 regs
+    were dumped).  Non-blocking loose ends: qdbus supportInformation
+    capture came back empty (env or binary issue, retry with
+    busctl --user in future); which exact window carries kwin's fb
+    (dump ESmart CTRL regs 0xfdd91c00 next time); VOP2 'dsp_hold
+    timeout' on DPMS transitions (one occurrence in boot2).
+  - MILESTONE: full Plasma 6 Wayland desktop session runs on the
+    unmodified Armbian 26.8.1 KDE image and presents live pixels
+    through the modeled VOP2, with virtio-gpu (Mali slot) providing
+    the render node.  Remaining for full interactivity: NO input
+    device in the model - second virtio-mmio transport +
+    virtio-keyboard-device + DTB node is the recipe (below).
+    model (no virtio-keyboard) - sendkey has nothing to inject into;
+    belongs to the missing-devices pass (second virtio-mmio transport
+    + virtio-keyboard-device + DTB node is the obvious recipe).
+
+  5f. Input devices + user-facing runner (boot5/boot6): the model had
+  no input path at all.  Machine now creates THREE virtio-mmio
+  transports inside the Mali window (src/rk3588.c
+  rk3588_create_virtio_gpu loop: 0xfb000000+i*0x1000, SPIs 92-94,
+  all overlap-priority 1 over the 'gpu' stub); DTB
+  rk3588s-orangepi-5-vgpu-boot.dtb got three virtio,mmio nodes
+  (gpu@fb000000 keeps #cooling-cells+phandle 0xf0 for the thermal
+  zone).  Device->transport assignment via qbus_realize prepending:
+  -device #1 (virtio-gpu-device) -> 0xfb002000, #2 (keyboard) ->
+  0xfb001000, #3 (tablet) -> 0xfb000000 - CONFIRMED by boot5 sysfs.
+  boot5: /proc/bus/input/devices shows 'QEMU Virtio Tablet' (mouse0/
+  event0 @ fb000000.gpu) + 'QEMU Virtio Keyboard' (kbd/event1 @
+  fb001000.keyboard) - both registered with evdev.  systemctl enable
+  sddm (persistent - future boots go straight to the session at
+  graphical.target).  boot5's INJECTED input self-test was INVALID:
+  driver mux bug (flipped c back to serial before sendkey ->
+  '-bash: sendkey: command not found'; the 'mouse' pixel diffs were
+  ambient session animation).  boot6 (kde-vgpu6.py, DONE - logs/p15-kde-input-*.{ppm,txt}):
+  graphical boot path (sddm enabled persistently, autologin, kwin +
+  plasmashell up), then the FIXED input test entirely inside the
+  monitor.  KEYBOARD PROVEN: ctrl-alt-t opened the Plasma
+  application launcher (kickoff), the typed 'echo INPUT-OK<ret>'
+  went into its search box and filtered the app list - 1.34M
+  pixels changed between dumps; konsole process never spawned
+  (shortcut binding on this image opens the launcher search
+  context instead - kglobalaccel binding nuance, not a model
+  issue).  MOUSE: mouse_move/mouse_button injected through the same
+  qemu_input chain; typed->mouse diff 727px ~ a moved cursor arrow
+  (net +100/+100 over 3 moves) - consistent with a SOFTWARE cursor
+  (rockchipdrm exposing no cursor plane), though not conclusive.
+  CAVEAT for users: if the pointer should turn out invisible,
+  'KWIN_FORCE_SW_CURSOR=1' in /etc/environment (guest) forces it
+  into kwin's framebuffer.
+   USER RUNNER: scripts/run-desktop.py - boots the prepared KDE image
+   with -M rk3588,vgpu=on + virtio-gpu/keyboard/tablet, GTK window when
+   DISPLAY/WAYLAND_DISPLAY is set (else -vnc :0), AppImage preferred
+   over build/qemu (APPIMAGE_EXTRACT_AND_RUN=1 when /dev/fuse missing),
+   graphical bootargs (no multi-user override), Ctrl-C = clean stop.
+   v1 used a BLIND timed U-Boot dance with QEMU stdout inherited
+   (mon:stdio) and HUNG for the user (autoboot stopped, a few prompts,
+   then silence - the guest never echoed setenv/booti); reproduced here
+   when stdout was a TTY/PTY.  v2 REWRITE: QEMU gets pipes on BOTH
+   stdin/stdout (the exact I/O shape of the proven drivers), a pump
+   thread tees guest output to the terminal + keeps a 64KB pattern
+   window, the dance is OUTPUT-DRIVEN challenge-response (CR-flood
+   gated on observed output, setenv/booti verified by the guest's own
+   echo, 4/3 retries each), stock-boot.scr takeover and QEMU exits are
+   detected and trigger up to 3 fresh-QEMU attempts, gtk->VNC display
+   fallback, SIGTTIN/SIGTTOU ignored so wrappers that leave the script
+   in a background process group cannot group-stop it mid-dance (that
+   freeze was half the bug: state T on python+QEMU together), serial
+   mirrored read-write (relay thread, login: root/empty).  Verified
+   under script(1)-PTY conditions that broke v1: prompt+setenv echo+
+   Starting kernel in 58s, systemd up, 200s SIGINT -> "stopping QEMU"
+   clean, no orphans.  AppImage rebuilt with the new binary (bundles
+   libvirglrenderer1 via ldd walk).
+
+  6. Housekeeping state: linux-7.2.9 tree pristine (RPMDBG
+  instrumentation reverted, Image rebuilt, verified 0 occurrences);
+  make run-linux-emmc green after all fixes (35 PASS / 0 FAIL /
+  LINUX-OK / HS400ES / CQE enabled).  qemu.patch now also carries the
+  Auto-CMD23 fix (sdhci-internal.h mask + sdhci.c injection); patch
+   regeneration list: git -C qemu diff -- hw/arm/Kconfig
+   hw/arm/meson.build hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdhci-internal.h
+   hw/sd/sdmmc-internal.h target/arm/helper.c > qemu.patch.
+   (target/arm/helper.c added 2026-10-13: the RMR_EL3 warm-reset hunk had
+   been dropped by an earlier partial-list regeneration.)  CAVEAT: CQE-enable on 7.2.9
+  seen failing silently in 2 of 4 runs (timing-flaky, pre-existing
+  post-PMU-mirror; card still registers, tests still pass) - needs a
+  dedicated pass.  Full regression sweep (run-linux custom DTB,
+  regress, sd-own-bl31, stock chain, appimage) still pending after
+  the PMU-mirror + ACMD23 changes.  The Armbian image file is now
+  DIRTY (root pw empty, gdm enabled, first-boot consumed) - that is
+  the working state; re-extract from the .xz for pristine boots.

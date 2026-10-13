@@ -99,8 +99,11 @@ static bool rk_display_gfx_update(void *opaque)
         return true;
     }
 
-    /* layer not programmed yet: keep the placeholder surface */
-    if (!(ctl & 1) || addr == 0 || vir == 0) {
+    /* layer not programmed yet: keep the placeholder surface.  A
+     * zero fb address is LEGAL on rk3588: DRAM is based at 0x0 and
+     * the kernel's CMA places the fbcon framebuffer at the very
+     * bottom (dri state: obj start=00000000, YRGB_MST=0). */
+    if (!(ctl & 1) || vir == 0) {
         return true;
     }
     width = (act & 0xffff) + 1;

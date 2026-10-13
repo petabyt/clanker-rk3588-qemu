@@ -61,6 +61,7 @@ struct RkVop2State {
     uint32_t regs[VOP2_REG_WINDOW / 4];
     uint32_t int_en[VOP2_NR_VPS];
     uint32_t int_status[VOP2_NR_VPS];
+    int irq_level;
 };
 
 static void rk_vop2_update_irq(struct RkVop2State *s)
@@ -70,6 +71,13 @@ static void rk_vop2_update_irq(struct RkVop2State *s)
     for (vp = 0; vp < VOP2_NR_VPS; vp++) {
         pending |= s->int_status[vp] & s->int_en[vp];
     }
+    if (getenv("RK3588_VOP_DEBUG") && pending != s->irq_level) {
+        fprintf(stderr, "VOPDBG: irq %d (en=%08x %08x %08x %08x st=%08x %08x %08x %08x)\n",
+                !!pending, s->int_en[0], s->int_en[1], s->int_en[2], s->int_en[3],
+                s->int_status[0], s->int_status[1], s->int_status[2],
+                s->int_status[3]);
+    }
+    s->irq_level = pending;
     qemu_set_irq(s->irq, !!pending);
 }
 
@@ -88,6 +96,15 @@ static void rk_vop2_frame_tick(void *opaque)
         if (s->int_en[vp] & VP_INT_FS_FIELD &&
             !(s->regs[VOP2_VP_CTRL(vp) / 4] & VP_DSP_CTRL_STANDBY)) {
             s->int_status[vp] |= VP_INT_FS_FIELD;
+        }
+    }
+    if (getenv("RK3588_VOP_DEBUG")) {
+        static int n;
+        if (!(n++ % 60)) {
+            fprintf(stderr, "VOPDBG: tick vp0 ctrl=%08x standby=%d fs_en=%d\n",
+                    s->regs[VOP2_VP_CTRL(0) / 4],
+                    !!(s->regs[VOP2_VP_CTRL(0) / 4] & VP_DSP_CTRL_STANDBY),
+                    !!(s->int_en[0] & VP_INT_FS_FIELD));
         }
     }
     rk_vop2_update_irq(s);
@@ -150,15 +167,27 @@ static void rk_vop2_write(void *opaque, hwaddr offset, uint64_t value,
         switch ((offset - 0x00a0) % 0x10) {
         case 0x0:                        /* INT_EN: write-mask */
             s->int_en[vp] = (s->int_en[vp] & ~mask) | (value & mask);
+            if (getenv("RK3588_VOP_DEBUG")) {
+                fprintf(stderr, "VOPDBG: vp%d INT_EN <- %08x (now %08x)\n",
+                        vp, (uint32_t)value, s->int_en[vp]);
+            }
             rk_vop2_update_irq(s);
             return;
         case 0x4:                        /* INT_CLR: masked W1C */
             s->int_status[vp] &= ~(value & mask);
+            if (getenv("RK3588_VOP_DEBUG")) {
+                fprintf(stderr, "VOPDBG: vp%d INT_CLR <- %08x (now %08x)\n",
+                        vp, (uint32_t)value, s->int_status[vp]);
+            }
             rk_vop2_update_irq(s);
             return;
         default:
             return;
         }
+    }
+    if (getenv("RK3588_VOP_DEBUG") && offset == VOP2_VP_CTRL(0)) {
+        fprintf(stderr, "VOPDBG: vp0 DSP_CTRL <- %08x (standby=%d)\n",
+                (uint32_t)value, !!(value & VP_DSP_CTRL_STANDBY));
     }
     s->regs[offset / 4] = value;
 }

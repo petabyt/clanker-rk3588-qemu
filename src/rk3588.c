@@ -37,10 +37,12 @@
 #include "target/arm/gtimer.h"
 #include "dw-apb-uart.h"
 #include "rk3588-dwmshc.h"
+#include "rk3588-timer.h"
 #include "rk3588-stubs.h"
 #include "rk3588-display.h"
 #include "rk3588-hdmi.h"
 #include "rk3588-vop2.h"
+#include "rk3588-iommu.h"
 #include "rk3588-sdhci.h"
 #include "hw/sd/sd.h"
 #include "system/blockdev.h"
@@ -153,6 +155,9 @@ static uint64_t rk3588_bl33_base = RK3588_BL33_BASE;
 /* SD-card boot: the FIT's edk2 node loads at 0x200000 (see plan.md P10). */
 #define RK3588_SD_BL33_BASE      0x00200000ULL
 static bool rk3588_bl33_explicit;
+/* Optional virtio-gpu transport at the Mali slot, -machine vgpu=on; the
+ * guest DTB must pair it with a virtio,mmio node replacing gpu@fb000000. */
+static bool rk3588_vgpu;
 
 struct RkParamHeader {
     uint8_t type;
@@ -344,6 +349,68 @@ static void rk3588_parse_v2_header(MachineState *ms)
     rk3588_bootrom_lite = true;
 }
 
+/*
+ * P10 Phase 2 fix (2026-10-11): the TPL's DDR training writes test
+ * patterns all over low DRAM (the DQ write/read test stores at the
+ * channel-interleave bases ch<<33, which the wrap aliases map onto low
+ * RAM — and channel 0's base is 0 directly), so a main image staged at
+ * address 0 at init time is clobbered before the TPL returns: the chain
+ * went silent right after the TPL's final "out".  The real BootROM
+ * loads the main image only AFTER the DDR blob returns, so the image
+ * bytes are kept in this shadow buffer and staged on the TPL's return
+ * (rk3588_bootrom_ret_read()).
+ */
+static uint8_t *rk3588_spl_shadow;
+static uint64_t rk3588_spl_len;
+static bool rk3588_spl_staged;
+
+/*
+ * "BootROM resume vector": a one-instruction MMIO trampoline the DDR
+ * blob returns into (x30 points here).  The first instruction fetch
+ * stages the shadowed main image to address 0, restores the bootrom
+ * call contract (x0 = bootdata, x1 = 8) and rewires x30 to 0 before
+ * handing out `br x30` — so the main image is entered exactly the way
+ * the real BootROM enters it after DDR init.  (MMIO fetch works in
+ * TCG; the region is otherwise inert and nothing else knows its
+ * address.)
+ */
+#define RK3588_BOOTROM_RET     0xFFFF0000ULL
+#define RK3588_INS_BR_X30      0xD61F03C0      /* br x30 */
+
+static uint64_t rk3588_bootrom_ret_read(void *opaque, hwaddr off,
+                                        unsigned size)
+{
+    ARMCPU *cpu = ARM_CPU(first_cpu);
+
+    if (!rk3588_spl_staged) {
+        rk3588_spl_staged = true;
+        physical_memory_write(0, rk3588_spl_shadow, rk3588_spl_len);
+        cpu->env.xregs[0] = RK3588_BOOTDATA;
+        cpu->env.xregs[1] = 8;
+        cpu->env.xregs[30] = 0;
+        /* SP stays where the TPL left it: SRAM, like the real bootrom's
+         * stack; the main image installs its own stack early. */
+    }
+    return RK3588_INS_BR_X30 >> (off * 8) &
+           (((uint64_t)1 << (size * 8)) - 1);
+}
+
+static void rk3588_bootrom_ret_write(void *opaque, hwaddr off,
+                                     uint64_t val, unsigned size)
+{
+    /* the bootrom is read-only */
+}
+
+static const MemoryRegionOps rk3588_bootrom_ret_ops = {
+    .read = rk3588_bootrom_ret_read,
+    .write = rk3588_bootrom_ret_write,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 /* Copies the two payloads into place (call at init, right after load+parse). */
 static void rk3588_stage_v2_images(void)
 {
@@ -353,21 +420,27 @@ static void rk3588_stage_v2_images(void)
         /* Card source (Phase 2): payloads were already read into RAM buffers. */
         physical_memory_write(RK3588_DDR_STAGE, rk3588_v2_ddr_buf,
                               rk3588_v2_ddr_len);
-        physical_memory_write(0, rk3588_v2_os_buf, rk3588_v2_os_len);
         g_free(rk3588_v2_ddr_buf);
-        g_free(rk3588_v2_os_buf);
-        rk3588_v2_ddr_buf = rk3588_v2_os_buf = NULL;
+        rk3588_v2_ddr_buf = NULL;
+        /* Main image goes to the shadow buffer, not to address 0 —
+         * see the comment above rk3588_spl_shadow. */
+        rk3588_spl_shadow = rk3588_v2_os_buf;
+        rk3588_spl_len = rk3588_v2_os_len;
+        rk3588_v2_os_buf = NULL;
         return;
     }
 
-    buf = g_malloc(MAX(rk3588_v2_ddr_len, rk3588_v2_os_len));
+    buf = g_malloc(rk3588_v2_ddr_len);
     physical_memory_read(rk3588_v2_ddr_off, buf, rk3588_v2_ddr_len);
     physical_memory_write(RK3588_DDR_STAGE, buf, rk3588_v2_ddr_len);
-
-    /* The bootrom "loads the main image to address 0 and jumps there". */
-    physical_memory_read(rk3588_v2_os_off, buf, rk3588_v2_os_len);
-    physical_memory_write(0, buf, rk3588_v2_os_len);
     g_free(buf);
+
+    /* The bootrom "loads the main image to address 0 and jumps there" —
+     * but only after the DDR blob returns (see rk3588_spl_shadow). */
+    rk3588_spl_len = rk3588_v2_os_len;
+    rk3588_spl_shadow = g_malloc(rk3588_v2_os_len);
+    physical_memory_read(rk3588_v2_os_off, rk3588_spl_shadow,
+                         rk3588_v2_os_len);
 }
 
 /*
@@ -513,8 +586,12 @@ static void rk3588_bootrom_lite_reset(void *opaque)
     env = &cpu->env;
     env->xregs[0] = RK3588_BOOTDATA;
     env->xregs[1] = 8;
-    env->xregs[30] = 0; /* blob returns to the main image at 0 */
+    /* The blob returns into the BootROM resume vector, which stages the
+     * (training clobbered) main image to 0 and enters it — see
+     * rk3588_bootrom_ret_read(). */
+    env->xregs[30] = RK3588_BOOTROM_RET;
     env->xregs[31] = RK3588_SRAM_BASE + RK3588_SRAM_SIZE; /* SP_EL3 in SRAM */
+    rk3588_spl_staged = false;
     cpu_set_pc(CPU(cpu), RK3588_DDR_STAGE);
 }
 
@@ -668,12 +745,100 @@ static void rk3588_create_display_devices(DeviceState *gic)
     sysbus_mmio_map(sbd, 0, 0xfdd90000);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 156));
 
+    /* vop_mmu: the VOP's runtime-PM supplier (iommu@fdd97e00, 2 windows) */
+    rk3588_create_iommu_window(0xfdd97e00);
+    rk3588_create_iommu_window(0xfdd97f00);
+
     dev = qdev_new(TYPE_RK3588_HDMI);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, 0xfde80000);
     for (i = 0; i < ARRAY_SIZE(hdmi_spis); i++) {
         sysbus_connect_irq(sbd, i, qdev_get_gpio_in(gic, hdmi_spis[i]));
+    }
+}
+
+/*
+ * rk3288-style timer (timer@feae0000, DTB compat "rockchip,rk3588-timer",
+ * "rockchip,rk3288-timer"): the stock OPi5 DTB boots it as the kernel's
+ * fallback clocksource/sched_clock (see src/rk3588-timer.c).  IRQ on its
+ * real GIC SPI 289 (0x121).
+ */
+/*
+ * Optional virtio devices at the Mali slot (0xfb000000, GIC SPIs 92-94):
+ * three virtio-mmio transports, 0x1000 apart, inside the old 2 MB Mali
+ * window.  Attach devices with -device, in this order:
+ *   -device virtio-gpu-device[,id=vgpu,xres=,yres=]     -> 0xfb002000 (SPI 94)
+ *   -device virtio-keyboard-device                      -> 0xfb001000 (SPI 93)
+ *   -device virtio-tablet-device                        -> 0xfb000000 (SPI 92)
+ * (qbus_realize() prepends child buses, so qbus_find_recursive() hands
+ * the first -device the last-created transport - same mechanism and
+ * ordering quirk as arm virt's create_virtio_devices()).  The guest DTB
+ * must carry a virtio,mmio node per transport; the guest identifies the
+ * device type from the transport itself.  Mapped with overlap priority
+ * 1 so they win over the plain 'gpu' storage stub in rk3588-stubs.c.
+ */
+static void rk3588_create_virtio_gpu(DeviceState *gic)
+{
+    for (int i = 0; i < 3; i++) {
+        DeviceState *transport = qdev_new("virtio-mmio");
+        SysBusDevice *sbd = SYS_BUS_DEVICE(transport);
+
+        qdev_prop_set_bit(transport, "force-legacy", false);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            0xfb000000 + i * 0x1000,
+                                            sysbus_mmio_get_region(sbd, 0), 1);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 92 + i));
+    }
+}
+
+static void rk3588_create_timer(DeviceState *gic)
+{
+    DeviceState *dev = qdev_new(TYPE_RK3588_TIMER);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, 0xfeae0000);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 289));
+}
+
+/*
+ * The three PrimeCell PL330 DMACs of the stock rk3588s DTB
+ * (dma-controller@fea10000/fea30000/fed10000, compat "arm,pl330",
+ * "arm,primecell").  Unmodelled, their periph-ID read at +0xfe0 raises a
+ * synchronous external abort in the guest's amba_device_try_add()
+ * (of_platform_populate) which kills PID 1 and panics the kernel.
+ * QEMU's in-tree pl330 model answers the ID registers (pl330_id[]).
+ * Each DTB node wires two IRQs (abort + one event), so num_events=1;
+ * model IRQ line 0 is abort, lines 1..num_events the event lines.
+ */
+static void rk3588_create_dmacs(DeviceState *gic)
+{
+    static const struct {
+        hwaddr base;
+        int irq0; /* abort */
+        int irq1; /* event 0 */
+    } dmacs[] = {
+        { 0xfea10000, 0x56, 0x57 },
+        { 0xfea30000, 0x58, 0x59 },
+        { 0xfed10000, 0x5a, 0x5b },
+    };
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(dmacs); i++) {
+        DeviceState *dev = qdev_new("pl330");
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+        object_property_set_link(OBJECT(dev), "memory",
+                                  OBJECT(get_system_memory()), &error_fatal);
+        qdev_prop_set_uint32(dev, "num_chnls", 8);
+        qdev_prop_set_uint8(dev, "num_periph_req", 32);
+        qdev_prop_set_uint8(dev, "num_events", 1);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, dmacs[i].base);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, dmacs[i].irq0));
+        sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(gic, dmacs[i].irq1));
     }
 }
 
@@ -808,7 +973,14 @@ static void rk3588_init(MachineState *ms)
     rk3588_load_firmware(ms, low_size);
     rk3588_parse_v2_header(ms);
     if (rk3588_bootrom_lite) {
+        MemoryRegion *bootrom_ret = g_new(MemoryRegion, 1);
+
         rk3588_stage_v2_images();
+        /* BootROM resume vector the DDR blob returns into (P10). */
+        memory_region_init_io(bootrom_ret, NULL, &rk3588_bootrom_ret_ops,
+                              NULL, "rk3588.bootrom-ret", 0x1000);
+        memory_region_add_subregion(get_system_memory(),
+                                    RK3588_BOOTROM_RET, bootrom_ret);
     }
     if (rk3588_atf) {
         rk3588_build_atf_params();
@@ -844,8 +1016,13 @@ static void rk3588_init(MachineState *ms)
     rk3588_connect_gic(ms, gic);
     rk3588_create_uarts(gic);
     rk3588_create_display_devices(gic);
+    rk3588_create_timer(gic);
+    rk3588_create_dmacs(gic);
     rk3588_create_sdmmc();
     rk3588_create_emmc(gic);
+    if (rk3588_vgpu) {
+        rk3588_create_virtio_gpu(gic);
+    }
     rk3588_create_stub_regions(get_system_memory());
     rk3588_display_init(ms);
 
@@ -933,6 +1110,20 @@ static void rk3588_set_bl33_base(Object *obj, Visitor *v, const char *name,
     }
 }
 
+static void rk3588_get_vgpu(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    bool val = rk3588_vgpu;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_vgpu(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_vgpu, errp);
+}
+
 static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -944,6 +1135,13 @@ static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
                                           "BL33 entry address passed to TF-A "
                                           "(0x800000 = U-Boot, "
                                           "0x200000 = EDK2 firmware FV)");
+    object_class_property_add(oc, "vgpu", "boolean",
+                              rk3588_get_vgpu, rk3588_set_vgpu,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "vgpu",
+                                          "Create a virtio-mmio transport at "
+                                          "the Mali slot (0xfb000000, SPI 92) "
+                                          "for -device virtio-gpu[-gl]-device");
     rk3588_machine_init(mc);
 }
 
