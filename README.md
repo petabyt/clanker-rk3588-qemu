@@ -1,41 +1,20 @@
-# rk3588 QEMU port
+# RK3588 Qemu port
 
-## Host packages required (Debian 13)
+Qemu platform support implemented for the RK3588. Goal is to get unmodified Armbian Ubuntu images booting to desktop.
 
-Installed so far (all via `apt-get install -y`):
+Mostly done by GLM5.3. I gave it the leaked RK3588 TRM and ARM v8a profile spec split up into text files for referencing.
 
-| Package        | Why                                              |
-|----------------|--------------------------------------------------|
-| bison          | U-Boot kconfig build (zconf parser)              |
-| flex           | U-Boot kconfig build (lexer)                     |
-| swig           | U-Boot python libs (dtc/pylibfdt)                |
-| python3-dev   | U-Boot python libs build headers                 |
-| libssl-dev     | U-Boot tools (fit image signing: openssl/evp.h)  |
-| libgnutls28-dev| U-Boot tools (mkeficapsule: gnutls/gnutls.h)     |
-| gdb            | QEMU host backtraces on abort (no target gdb needed) |
-| gdb-multiarch  | AArch64 guest debugging of the P8 DDR blob (plain gdb has no aarch64 target) |
-| python3-venv   | QEMU configure creates its meson venv (ensurepip)                             |
+- [x] Emulate 16gb LPDDR5 + DDR training
+- [x] HDMI, VOP2, eDP
+- [x] GPIO, IOMUX, PMU, sha256 crypto, etc
+- [ ] Implementing Mali GPU is not practical. Try and pass in virtio-gpu and get that working with VOP2 somehow.
+- [ ] NPU - possibly incorporate research from https://github.com/widgetii/orangepi5plus-npu
 
-Toolchain: `aarch64-linux-gnu-gcc` (preinstalled; used for rk and U-Boot
-cross builds via `CROSS_COMPILE=aarch64-linux-gnu-`).
-
-## Portable AppImage
-
-```sh
-make appimage        # -> rk3588-qemu-x86_64.AppImage (~32 MB)
-```
-
-Packages `build/qemu/qemu-system-aarch64` with its shared libraries
-(`linuxdeploy`) and the pc-bios datadir (`AppDir/usr/share/qemu`, found at
-runtime via QEMU's relocated-path rewriting), then wraps it with
-`appimagetool`. Requires both tools on `PATH`; the recipe sets
-`APPIMAGE_EXTRACT_AND_RUN=1` so they also work on hosts without `/dev/fuse`.
-
-Run it like the built binary:
-
-```sh
-./rk3588-qemu-x86_64.AppImage -M rk3588 -nographic -serial mon:stdio \
-    -bios rk/genbook_demo.img
-# fuse-less host: prepend APPIMAGE_EXTRACT_AND_RUN=1 or use
-# ./rk3588-qemu-x86_64.AppImage --appimage-extract-and-run ...
-```
+Milestones I gave the LLM:
+1. Get my [rk bootloader](https://github.com/petabyt/rk) working
+2. Get the proprietary DDR image working
+  - I gave it maskrom access to an Orange Pi 5 for it to work out some details
+3. Get EDKII working
+4. Get ATF working
+5. Get minimal Linux/busybox working
+6. Boot unmodified Armbian images
