@@ -309,14 +309,52 @@ static uint64_t rk_stub_otp_read(uint32_t stored, hwaddr off)
     return stored;
 }
 
+/*
+ * TRNG (fe378000) behavioural model for the Linux rockchip-rng driver
+ * (perf.md B4).  rk3588_rng_init() polls TRNG_V1_STAT (0x04) until SEEDED
+ * (bit9) is set with GENERATING (bit30) / RESEEDING (bit31) clear; a
+ * zero read-back never satisfies that, which is the observed
+ * "timed out waiting for hwrng to reseed" (-ETIMEDOUT after 10ms).
+ *
+ * The read path (rk3588_rng_read) writes CTRL=RAND then polls ISTAT (0x14)
+ * for RAND_RDY (bit0, already faked) and copies 32 bytes out of RAND0..7
+ * (0x20..0x3c).  The driver polls — no IRQ, so no SPI wiring is needed.
+ * Random bytes come from a simple xorshift seeded by the host clock;
+ * quality is irrelevant here, the point is that the poll terminates and
+ * the guest gets non-zero data.
+ */
+static uint32_t rk_rng_prng_state;
+static bool rk_rng_prng_seeded;
+
+static uint32_t rk_rng_prng(void)
+{
+    uint32_t x;
+
+    if (!rk_rng_prng_seeded) {
+        rk_rng_prng_state = (uint32_t)g_get_monotonic_time() ^ 0x9e3779b9u;
+        rk_rng_prng_seeded = true;
+    }
+    x = rk_rng_prng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return rk_rng_prng_state = x;
+}
+
 static uint64_t rk_stub_rng_read(uint32_t stored, hwaddr off)
 {
     switch (off) {
+    case 0x04:
+        return 1u << 9;        /* TRNG_V1_STAT: SEEDED, idle */
     case 0xf0:
         return 0x46bc;         /* TRNG_V1_VERSION */
     case 0x14:
         stored |= 1u << 0;     /* ISTAT: RAND_RDY */
         break;
+    }
+    /* RAND0..RAND7 (0x20..0x3c): random payload */
+    if (off >= 0x20 && off <= 0x3c) {
+        return rk_rng_prng();
     }
     return stored;
 }
@@ -543,21 +581,6 @@ static uint64_t rk_stub_gpio0_read(uint32_t stored, hwaddr off)
 {
     if (off == 0x70 && !rk3588_sd_card_inserted) {
         stored |= 1u << 4;      /* PA4: SD CD deasserted (no card) */
-    }
-    return stored;
-}
-
-/*
- * Rockchip RK I2C (I2cDxe): every transaction waits on I2C_IPD (0x01c)
- * pending bits.  Always report START/STOP/tx/rx done (bit6 NAK stays
- * clear so transfers "succeed" with zero data instead of failing) —
- * no device on the bus answers, and probes must not burn the 100ms
- * software timeout per transaction.
- */
-static uint64_t rk_stub_i2c_read(uint32_t stored, hwaddr off)
-{
-    if (off == 0x01c) {
-        stored = (stored & ~0x7fu) | 0x3f;
     }
     return stored;
 }
@@ -927,25 +950,11 @@ static const RkStubBlock rk_stub_blocks[] = {
       .read_hook = rk_stub_gmac_read },
     { .name = "gmac1", .base = 0xfe1c0000, .size = 0x2000,
       .read_hook = rk_stub_gmac_read },
-    /* RK I2C controllers (i2c0..i2c8), plain registers */
-    { .name = "i2c0", .base = 0xfd880000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c1", .base = 0xfea90000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c2", .base = 0xfeaa0000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c3", .base = 0xfeab0000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c4", .base = 0xfeac0000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c5", .base = 0xfead0000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c6", .base = 0xfec80000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c7", .base = 0xfec90000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
-    { .name = "i2c8", .base = 0xfeca0000, .size = 0x1000,
-      .read_hook = rk_stub_i2c_read },
+    /* RK I2C controllers (i2c0..i2c8) are now real behavioural rk3x
+       devices (rk3588-i2c.c, B5 perf.md) mapped at their DTB bases with
+       GIC SPI wiring — the passive storage stubs are gone so the Linux
+       driver's interrupt handshake completes (and absent addresses NACK
+       to a fast -ENXIO instead of -ETIMEDOUT). */
 
     /* Rockchip SPI controllers (spi0..spi4), plain registers */
     { .name = "spi0", .base = 0xfeb00000, .size = 0x1000,

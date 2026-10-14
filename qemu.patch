@@ -19,14 +19,14 @@ index 4445f16..317c847 100644
      bool
      default y
 diff --git a/hw/arm/meson.build b/hw/arm/meson.build
-index bcc068d..9f6ad09 100644
+index bcc068d..d2032ed 100644
 --- a/hw/arm/meson.build
 +++ b/hw/arm/meson.build
 @@ -12,6 +12,7 @@ arm_common_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx.c', 'npcm7xx_b
  arm_common_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm8xx.c', 'npcm8xx_boards.c'))
  arm_common_ss.add(when: 'CONFIG_REALVIEW', if_true: files('realview.c'))
  arm_common_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa-ref.c'))
-+arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c'))
++arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c', 'rk3588/rk3588-i2c.c'))
  arm_common_ss.add(when: 'CONFIG_STELLARIS', if_true: files('stellaris.c'))
  arm_common_ss.add(when: 'CONFIG_STM32VLDISCOVERY', if_true: files('stm32vldiscovery.c'))
  arm_common_ss.add(when: 'CONFIG_ZYNQ', if_true: files('xilinx_zynq.c'))

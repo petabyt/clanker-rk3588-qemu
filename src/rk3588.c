@@ -45,6 +45,7 @@
 #include "rk3588-vop2.h"
 #include "rk3588-iommu.h"
 #include "rk3588-sdhci.h"
+#include "rk3588-i2c.h"
 #include "hw/sd/sd.h"
 #include "system/blockdev.h"
 #include "system/block-backend-io.h"
@@ -778,6 +779,46 @@ static void rk3588_create_uarts(DeviceState *gic)
  *    behaviourally raised (I2CM/DDC completions); the HPD "level" the
  *    glue polls lives in sys_grf 0x384 (stub read hook, connected).
  */
+/*
+ * RK3588 I2C controllers i2c0..i2c8 (rk3x, interrupt driven).  Each maps
+ * at its DTB base and raises its real GIC SPI (the raw DTB interrupts
+ * cell 0x13d..0x145 — same convention as the uarts: the board passes the
+ * SPI number and QEMU's GIC adds GIC_INTERNAL itself, see gicv3_set_irq).
+ * Only bus 6 (i2c6 @0xfec80000)
+ * carries the HYM8563 RTC at 0x51, so that instance gets has-rtc; every
+ * other address on every bus NACKs -> the driver reports a fast -ENXIO
+ * instead of the -ETIMEDOUT (-110) probe storms the storage stubs caused.
+ */
+static void rk3588_create_i2cs(DeviceState *gic)
+{
+    static const struct {
+        hwaddr base;
+        int spi;
+        bool rtc;
+    } i2cs[] = {
+        { 0xfd880000, 317, false },   /* i2c0, SPI 0x13d */
+        { 0xfea90000, 318, false },   /* i2c1, SPI 0x13e */
+        { 0xfeaa0000, 319, false },   /* i2c2, SPI 0x13f */
+        { 0xfeab0000, 320, false },   /* i2c3, SPI 0x140 */
+        { 0xfeac0000, 321, false },   /* i2c4, SPI 0x141 */
+        { 0xfead0000, 322, false },   /* i2c5, SPI 0x142 */
+        { 0xfec80000, 323, true  },   /* i2c6, SPI 0x143: hym8563 @0x51 */
+        { 0xfec90000, 324, false },   /* i2c7, SPI 0x144 */
+        { 0xfeca0000, 325, false },   /* i2c8, SPI 0x145 */
+    };
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(i2cs); i++) {
+        DeviceState *dev = qdev_new(TYPE_RK3588_I2C);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+        qdev_prop_set_bit(dev, "has-rtc", i2cs[i].rtc);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, i2cs[i].base);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, i2cs[i].spi));
+    }
+}
+
 static void rk3588_create_display_devices(DeviceState *gic)
 {
     static const int hdmi_spis[] = { 169, 170, 171, 172, 360 };
@@ -1092,6 +1133,7 @@ static void rk3588_init(MachineState *ms)
     gic = rk3588_create_gic(ms);
     rk3588_connect_gic(ms, gic);
     rk3588_create_uarts(gic);
+    rk3588_create_i2cs(gic);
     rk3588_create_display_devices(gic);
     rk3588_create_timer(gic);
     rk3588_create_dmacs(gic);
