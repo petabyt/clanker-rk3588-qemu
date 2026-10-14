@@ -18,3 +18,5 @@ Milestones I gave the LLM:
 4. Get ATF working
 5. Get minimal Linux/busybox working
 6. Boot unmodified Armbian images
+
+Build system is setup so that a small patch (qemu.patch) is applied to the qemu submodule, and src/ is symlinked to `qemu/hw/arm/rk3588`
