@@ -35,6 +35,7 @@
 #include "target/arm/cpu.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/gtimer.h"
+#include "target/arm/internals.h"
 #include "dw-apb-uart.h"
 #include "rk3588-dwmshc.h"
 #include "rk3588-timer.h"
@@ -621,6 +622,51 @@ static void rk3588_atf_reset(void *opaque)
     cpu_set_pc(CPU(cpu), rk3588_atf_entry);
 }
 
+/*
+ * PSCI secondary bring-up (perf.md A2/A3): TF-A is the PSCI provider
+ * (no QEMU psci-conduit).  Its CPU_ON path (rockchip_soc_cores_pwr_dm_on)
+ * writes PMU2_CPU_AUTO_PWR_CON and returns success; on real silicon the
+ * PMU then powers the core, which fetches pmu_cpuson_entrypoint in PMUSRAM
+ * (0xFF100000, loaded with the bl31 ELF).  The PMU stub calls this when
+ * core_pm_sft_wakeup_en is set.  Mirrors QEMU's own
+ * arm_set_cpu_on_async_work (target/arm/arm-powerctl.c:56): the actual
+ * work runs on the target vCPU thread via async_run_on_cpu, so it is
+ * safe to call from any vCPU's MMIO context under MTTCG.
+ */
+static bool rk3588_cpu_woken[RK3588_NR_CPUS];
+
+static void rk3588_pmu_cpu_wake_async(CPUState *cs, run_on_cpu_data data)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+
+    cpu_reset(cs);
+    arm_emulate_firmware_reset(cs, 3);   /* EL3 firmware mode */
+    cs->halted = 0;
+    arm_set_cpu_power_state(cpu, PSCI_ON);
+    cpu_set_pc(cs, RK3588_SRAM1_BASE);   /* pmusram entry */
+}
+
+void rk3588_pmu_cpu_wake(int cpu_index)
+{
+    CPUState *cs;
+
+    if (cpu_index <= 0 || cpu_index >= RK3588_NR_CPUS) {
+        return;
+    }
+    if (rk3588_cpu_woken[cpu_index]) {
+        return;    /* already on */
+    }
+    rk3588_cpu_woken[cpu_index] = true;
+    cs = CPU(qemu_get_cpu(cpu_index));
+    async_run_on_cpu(cs, rk3588_pmu_cpu_wake_async, RUN_ON_CPU_NULL);
+}
+
+static void rk3588_smp_reset(void *opaque)
+{
+    memset(rk3588_cpu_woken, 0, sizeof(rk3588_cpu_woken));
+    /* start-powered-off re-parks secondaries via cpu_reset (A3). */
+}
+
 static DeviceState *rk3588_create_gic(MachineState *ms)
 {
     DeviceState *gic = qdev_new(gicv3_class_name());
@@ -745,9 +791,31 @@ static void rk3588_create_display_devices(DeviceState *gic)
     sysbus_mmio_map(sbd, 0, 0xfdd90000);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 156));
 
-    /* vop_mmu: the VOP's runtime-PM supplier (iommu@fdd97e00, 2 windows) */
-    rk3588_create_iommu_window(0xfdd97e00);
-    rk3588_create_iommu_window(0xfdd97f00);
+    /*
+     * Rockchip IOMMU windows (compat "rockchip,rk3568-iommu", B2 perf.md).
+     * Behavioral model (rk3588-iommu.c) so FORCE_RESET / paging-enable
+     * probes complete instead of hanging on storage stubs.
+     *
+     * Multi-window nodes: fdab9000 (NPU0, 2x0x100), fdc38700 (rkvdec0,
+     * 2x0x40), fdc40700 (rkvdec1, 2x0x40), fdd97e00 (vop, 2x0x100).
+     * Single-window: fdaca000/fdada000 (NPU1/2), fdb50800..fdbac800
+     * (video-codec unit 0x40 spans).  av1-iommu (fdca0000) is verisilicon
+     * compat, not rk_iommu; left as storage for graceful probe fail.
+     * SMMU-v3 (fc900000/fcb00000) is not modeled here.
+     */
+    static const struct { uint64_t base; uint64_t size; } iommus[] = {
+        { 0xfdab9000, 0x100 }, { 0xfdaba000, 0x100 },
+        { 0xfdaca000, 0x100 }, { 0xfdada000, 0x100 },
+        { 0xfdb50800, 0x40 },  { 0xfdba0800, 0x40 },
+        { 0xfdba4800, 0x40 },  { 0xfdba8800, 0x40 },
+        { 0xfdbac800, 0x40 },
+        { 0xfdc38700, 0x40 },  { 0xfdc38740, 0x40 },
+        { 0xfdc40700, 0x40 },  { 0xfdc40740, 0x40 },
+        { 0xfdd97e00, 0x100 }, { 0xfdd97f00, 0x100 },
+    };
+    for (unsigned n = 0; n < ARRAY_SIZE(iommus); n++) {
+        rk3588_create_iommu_window(iommus[n].base, iommus[n].size);
+    }
 
     dev = qdev_new(TYPE_RK3588_HDMI);
     sbd = SYS_BUS_DEVICE(dev);
@@ -765,9 +833,10 @@ static void rk3588_create_display_devices(DeviceState *gic)
  * real GIC SPI 289 (0x121).
  */
 /*
- * Optional virtio devices at the Mali slot (0xfb000000, GIC SPIs 92-94):
- * three virtio-mmio transports, 0x1000 apart, inside the old 2 MB Mali
+ * Optional virtio devices at the Mali slot (0xfb000000, GIC SPIs 92-94,
+ * 98): four virtio-mmio transports, 0x1000 apart, inside the old 2 MB Mali
  * window.  Attach devices with -device, in this order:
+ *   -device virtio-net-device,netdev=net0               -> 0xfb003000 (SPI 98)
  *   -device virtio-gpu-device[,id=vgpu,xres=,yres=]     -> 0xfb002000 (SPI 94)
  *   -device virtio-keyboard-device                      -> 0xfb001000 (SPI 93)
  *   -device virtio-tablet-device                        -> 0xfb000000 (SPI 92)
@@ -777,10 +846,15 @@ static void rk3588_create_display_devices(DeviceState *gic)
  * must carry a virtio,mmio node per transport; the guest identifies the
  * device type from the transport itself.  Mapped with overlap priority
  * 1 so they win over the plain 'gpu' storage stub in rk3588-stubs.c.
+ * SPI 95 (0x5f) is taken by video-codec@fdc38000 in the stock DTB, so
+ * the net transport uses SPI 98 (0x62).
  */
 static void rk3588_create_virtio_gpu(DeviceState *gic)
 {
-    for (int i = 0; i < 3; i++) {
+    /* SPI numbers for the four transports, lowest-to-highest address */
+    static const int spi[4] = { 92, 93, 94, 98 };
+
+    for (int i = 0; i < 4; i++) {
         DeviceState *transport = qdev_new("virtio-mmio");
         SysBusDevice *sbd = SYS_BUS_DEVICE(transport);
 
@@ -789,7 +863,7 @@ static void rk3588_create_virtio_gpu(DeviceState *gic)
         memory_region_add_subregion_overlap(get_system_memory(),
                                             0xfb000000 + i * 0x1000,
                                             sysbus_mmio_get_region(sbd, 0), 1);
-        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 92 + i));
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, spi[i]));
     }
 }
 
@@ -989,11 +1063,14 @@ static void rk3588_init(MachineState *ms)
     for (i = 0; i < ms->smp.cpus; i++) {
         Object *cpuobj = object_new(ms->cpu_type);
         /*
-         * QEMU's default affinity packs all 8 cores into 0x000-0x007;
-         * RK3588 has two clusters of four (A76 + A55).
+         * MPIDR affinity1 = cluster, affinity0 = core-within-cluster, i.e.
+         * mpidr = i << 8 (0x000, 0x100 ... 0x700).  Every guest DTB (stock
+         * and Armbian) lists cpu@ reg values in that layout and TF-A's
+         * plat_core_pos_by_mpidr assumes it; the older "two clusters of
+         * four" (i / 0x100|(i-4)) assignment collided vCPU4 with vCPU1 and
+         * left 0x200-0x700 with no vCPU (perf.md A1).
          */
-        uint64_t affinity = i < RK3588_CLUSTER_SIZE ?
-                            i : 0x100 | (i - RK3588_CLUSTER_SIZE);
+        uint64_t affinity = (uint64_t)i << 8;
 
         object_property_set_int(cpuobj, "cntfrq", RK3588_CNTFRQ_HZ,
                                 &error_abort);
@@ -1071,6 +1148,9 @@ static void rk3588_init(MachineState *ms)
     qemu_register_reset(rk3588_bootrom_lite_reset, NULL);
     /* ATF: same deal — wire x0..x3/SP after do_cpu_reset. */
     qemu_register_reset(rk3588_atf_reset, NULL);
+    /* SMP: forget which secondaries were woken (A3); do_cpu_reset has
+     * already re-parked the start-powered-off CPUs. */
+    qemu_register_reset(rk3588_smp_reset, NULL);
 }
 
 static void rk3588_machine_init(MachineClass *mc)

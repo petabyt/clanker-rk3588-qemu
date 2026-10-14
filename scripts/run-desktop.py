@@ -222,6 +222,8 @@ def main():
         "-device", f"loader,file={vmlinuz},addr=0x02000000,force-raw=on",
         "-device", f"loader,file={gdtb},addr=0x0a100000,force-raw=on",
         "-dtb", qdtb,
+        "-netdev", "user,id=net0",
+        "-device", "virtio-net-device,netdev=net0",
         "-device", "virtio-gpu-device,id=vgpu,xres=1920,yres=1080",
         "-device", "virtio-keyboard-device",
         "-device", "virtio-tablet-device",

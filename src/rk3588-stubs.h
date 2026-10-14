@@ -17,4 +17,10 @@ void rk3588_create_stub_regions(MemoryRegion *sysmem);
  */
 extern bool rk3588_atf_mode;
 
+/*
+ * Machine hook (rk3588.c): the PMU stub calls this when TF-A writes
+ * core_pm_sft_wakeup_en to PMU2_CPU_AUTO_PWR_CON(cpu) (CPU_ON, perf.md A2).
+ */
+void rk3588_pmu_cpu_wake(int cpu_index);
+
 #endif

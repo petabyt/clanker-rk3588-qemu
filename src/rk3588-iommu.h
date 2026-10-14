@@ -13,6 +13,6 @@
 #define TYPE_RK3588_IOMMU "rk3588-iommu"
 OBJECT_DECLARE_SIMPLE_TYPE(RkIommuState, RK3588_IOMMU);
 
-void rk3588_create_iommu_window(uint64_t base);
+void rk3588_create_iommu_window(uint64_t base, uint64_t size);
 
 #endif

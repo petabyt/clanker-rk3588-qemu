@@ -13,7 +13,7 @@ Mostly done by GLM5.3. I gave it the leaked RK3588 TRM and ARM v8a profile spec 
 Milestones I gave the LLM:
 1. Get my [rk bootloader](https://github.com/petabyt/rk) working
 2. Get the proprietary DDR image working
-  - I gave it maskrom access to an Orange Pi 5 for it to work out some details
+    - I gave it maskrom access to an Orange Pi 5 for it to work out some details
 3. Get EDKII working
 4. Get ATF working
 5. Get minimal Linux/busybox working

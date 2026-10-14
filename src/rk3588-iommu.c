@@ -36,6 +36,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/core/sysbus.h"
+#include "system/address-spaces.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "rk3588-iommu.h"
@@ -57,6 +58,7 @@ struct RkIommuState {
     bool paging;
     bool stall;
     uint32_t dte;
+    uint64_t size;
 };
 
 static uint64_t rk_iommu_read(void *opaque, hwaddr offset, unsigned size)
@@ -144,9 +146,13 @@ static void rk_iommu_realize(DeviceState *dev, Error **errp)
 {
     RkIommuState *s = RK3588_IOMMU(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    uint64_t size = s->size ? s->size : 0x100;
 
+    if (size < 0x10) {
+        size = 0x10;
+    }
     memory_region_init_io(&s->iomem, OBJECT(dev), &rk_iommu_ops, s,
-                          "rk3588.iommu", 0x100);
+                          "rk3588.iommu", size);
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
@@ -173,11 +179,14 @@ static void rk_iommu_register_types(void)
 }
 type_init(rk_iommu_register_types)
 
-void rk3588_create_iommu_window(uint64_t base)
+void rk3588_create_iommu_window(uint64_t base, uint64_t size)
 {
     DeviceState *dev = qdev_new(TYPE_RK3588_IOMMU);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    RK3588_IOMMU(dev)->size = size;
     sysbus_realize_and_unref(sbd, &error_fatal);
-    sysbus_mmio_map(sbd, 0, base);
+    /* Priority 1 so these win over plain storage stubs (npu/codecs/vdec). */
+    memory_region_add_subregion_overlap(get_system_memory(), base,
+                                        sysbus_mmio_get_region(sbd, 0), 1);
 }

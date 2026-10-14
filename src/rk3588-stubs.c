@@ -181,6 +181,9 @@ static uint32_t rk_pmu_pwr_gate_en;
  */
 static uint32_t rk_pmu_idle_req[2];
 
+/* PMU2_CPU_AUTO_PWR_CON has one word per core (TF-A PLATFORM_CORE_COUNT). */
+#define RK3588_PMU_NR_CPUS  8
+
 static void rk_stub_pmu_write(hwaddr off, uint64_t value)
 {
     if (off == 0x8154) {
@@ -188,6 +191,26 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
         uint32_t data = value & 0x3;
 
         rk_pmu_pwr_gate_en = (rk_pmu_pwr_gate_en & ~wen) | (data & wen);
+    }
+    /*
+     * PMU2_CPU_AUTO_PWR_CON(cpu) (0x8010+4*cpu, hiword write-enable).
+     * TF-A cpus_power_domain_on() (atf/.../pmu.c:733-736) clears
+     * core_pm_en (bit0) then sets core_pm_sft_wakeup_en (bit3) and
+     * returns PSCI success without waiting — the real PMU then powers
+     * the core and it fetches pmu_cpuson_entrypoint (0xFF100000).
+     * QEMU has no PMU power model, so treat "sft_wakeup_en being set"
+     * as the wake event and bring the vCPU up ourselves (perf.md A2).
+     */
+    if (off >= 0x8010 && off < 0x8010 + RK3588_PMU_NR_CPUS * 4 &&
+        ((off - 0x8010) & 3) == 0) {
+        uint32_t cpu = (off - 0x8010) / 4;
+        uint32_t wen = value >> 16;
+        uint32_t data = value & 0xffff;
+
+        /* Setting core_pm_sft_wakeup_en (bit 3) requests the wake. */
+        if ((data & wen & (1u << 3)) || (wen == 0 && (data & (1u << 3)))) {
+            rk3588_pmu_cpu_wake(cpu);
+        }
     }
     if (off == 0x810c || off == 0x8110) {
         uint32_t idx = (off - 0x810c) / 4;
@@ -241,6 +264,17 @@ static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
      *   +0x8290 repair status (1'b1 = on)      -> all domains on
      * power_on then short-circuits in rockchip_pd_power(); power_off
      * polls fail after the 10 ms readx timeout and the domain stays on.
+     *
+     * B3 note: making power_off actually succeed (tracking pwr writes
+     * and reflecting them in status/repair reads) broke pm-genpd at
+     * probe: need_regulator domains (gpu/npu/vcodec) call
+     * rockchip_pd_power(pd, false) before pm_genpd_init; with a
+     * working power_off, is_on returns false and pm_genpd_init gets
+     * start_off=true, after which pm_genpd_add_subdomain() returns
+     * -EINVAL for the npu->nputop edge and the whole rockchip-pm-domain
+     * probe fails.  Deferred until a fix that keeps need_regulator
+     * domains "on" from genpd's perspective (e.g. skip pwr tracking
+     * for the probe-time write, or fix the genpd interaction).
      */
     if (off == 0x8180 || off == 0x81f8) {
         return 0;
@@ -1017,10 +1051,18 @@ static const RkStubBlock rk_stub_blocks[] = {
      */
     { .name = "smmu-v3", .base = 0xfc900000, .size = 0x2000 },
     { .name = "gpu", .base = 0xfb000000, .size = 0x2000 },
+    /*
+     * NPU / video-codec / rkvdec: the rockchip IOMMU behavioral model
+     * (rk3588-iommu.c, B2) is mapped at the iommu@ bases with overlap
+     * priority 1 and wins those sub-ranges; these plain stubs cover the
+     * surrounding device MMIO so probes fail gracefully.
+     */
     { .name = "npu", .base = 0xfdab0000, .size = 0x30000 },
     { .name = "codecs", .base = 0xfdb50000, .size = 0x60000 },
     { .name = "vdec", .base = 0xfdc38000, .size = 0xd000 },
     { .name = "av1", .base = 0xfdc70000, .size = 0x1000 },
+    /* av1-iommu (fdca0000) is verisilicon compat, not rk_iommu; leave
+       as storage for graceful probe fail. */
     { .name = "av1-iommu", .base = 0xfdca0000, .size = 0x1000 },
     { .name = "vop-mmu-gap", .base = 0xfdd97000, .size = 0xe00 },
     { .name = "i2s-tdm0", .base = 0xfddf0000, .size = 0x1000 },

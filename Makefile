@@ -188,14 +188,25 @@ $(EMMC_DTB): images/rk3588s-orangepi-5-stock.dtb
 
 # P12 stock-DTB milestone: identical to run-linux but with the unmodified
 # in-tree rk3588s-orangepi-5 DTB (Armbian kernel DTBs derive from it).
-run-linux-stock: $(QEMU_BIN) images/rk3588s-orangepi-5-stock.dtb $(INITRD_BIN) images/emmc.img
+# cpu-idle-states dropped (perf.md A4): with SMP the secondary CPUs idle
+# immediately and PSCI suspend drives TF-A into cortex_a76_core_pwr_dwn,
+# whose CPUECTLR_EL3 read (s3_0_c15_c2_7) is UNDEF under TCG and
+# warm-resets the machine (same strip the EMMC_DTB rule already does).
+STOCK_SMP_DTB := images/rk3588s-orangepi-5-stock-smp.dtb
+$(STOCK_SMP_DTB): images/rk3588s-orangepi-5-stock.dtb
+	cp images/rk3588s-orangepi-5-stock.dtb $(STOCK_SMP_DTB)
+	for cpu in $$(fdtget -l $(STOCK_SMP_DTB) /cpus); do \
+		fdtput -d $(STOCK_SMP_DTB) /cpus/$$cpu cpu-idle-states 2>/dev/null || true; \
+	done
+
+run-linux-stock: $(QEMU_BIN) $(STOCK_SMP_DTB) $(INITRD_BIN) images/emmc.img
 	mkdir -p $(LOG_DIR)
 	-timeout 290 $(QEMU_RK3588) \
 		-bios atf/build/rk3588/release/bl31/bl31.elf \
 		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
 		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
 		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
-		-device loader,file=images/rk3588s-orangepi-5-stock.dtb,addr=0x0a100000,force-raw=on \
+		-device loader,file=$(STOCK_SMP_DTB),addr=0x0a100000,force-raw=on \
 		-dtb u-boot/dts/dt.dtb \
 		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
 		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-stock-int.log \
