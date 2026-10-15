@@ -42,10 +42,12 @@
 #include "rk3588-stubs.h"
 #include "rk3588-display.h"
 #include "rk3588-hdmi.h"
+#include "rk3588-edp.h"
 #include "rk3588-vop2.h"
 #include "rk3588-iommu.h"
 #include "rk3588-sdhci.h"
 #include "rk3588-i2c.h"
+#include "rk3588-i2chid.h"
 #include "hw/sd/sd.h"
 #include "system/blockdev.h"
 #include "system/block-backend-io.h"
@@ -795,16 +797,17 @@ static void rk3588_create_i2cs(DeviceState *gic)
         hwaddr base;
         int spi;
         bool rtc;
+        bool tp;
     } i2cs[] = {
-        { 0xfd880000, 317, false },   /* i2c0, SPI 0x13d */
-        { 0xfea90000, 318, false },   /* i2c1, SPI 0x13e */
-        { 0xfeaa0000, 319, false },   /* i2c2, SPI 0x13f */
-        { 0xfeab0000, 320, false },   /* i2c3, SPI 0x140 */
-        { 0xfeac0000, 321, false },   /* i2c4, SPI 0x141 */
-        { 0xfead0000, 322, false },   /* i2c5, SPI 0x142 */
-        { 0xfec80000, 323, true  },   /* i2c6, SPI 0x143: hym8563 @0x51 */
-        { 0xfec90000, 324, false },   /* i2c7, SPI 0x144 */
-        { 0xfeca0000, 325, false },   /* i2c8, SPI 0x145 */
+        { 0xfd880000, 317, false, false },   /* i2c0, SPI 0x13d */
+        { 0xfea90000, 318, false, false },   /* i2c1, SPI 0x13e */
+        { 0xfeaa0000, 319, false, false },   /* i2c2, SPI 0x13f */
+        { 0xfeab0000, 320, false, false },   /* i2c3, SPI 0x140 */
+        { 0xfeac0000, 321, false, false },   /* i2c4, SPI 0x141 */
+        { 0xfead0000, 322, false, true  },   /* i2c5: hid-over-i2c touchpad @0x2c */
+        { 0xfec80000, 323, true,  false },   /* i2c6, SPI 0x143: hym8563 @0x51 */
+        { 0xfec90000, 324, false, false },   /* i2c7, SPI 0x144 */
+        { 0xfeca0000, 325, false, false },   /* i2c8, SPI 0x145 */
     };
     int i;
 
@@ -813,10 +816,42 @@ static void rk3588_create_i2cs(DeviceState *gic)
         SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
         qdev_prop_set_bit(dev, "has-rtc", i2cs[i].rtc);
+        qdev_prop_set_bit(dev, "has-touchpad", i2cs[i].tp);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, i2cs[i].base);
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, i2cs[i].spi));
     }
+}
+
+/*
+ * Genbook-faithful input wiring:
+ *  - touchpad: the i2c-hid slave drives GPIO1_PD6; here we hand the GIC
+ *    SPI 278 line to the stub layer (rk3588_touchpad_set_line()).
+ *  - keyboard: QEMU's in-tree sysbus OHCI at the RK3588 USB host0 OHCI
+ *    window (0xfc840000, SPI 216) with a USB HID keyboard on its root
+ *    hub — the real genbook keyboard enumerates over this port (the
+ *    firmware's "keyboard_en" = mainline vcc5v0_usb_host enable).
+ */
+static void rk3588_create_input(DeviceState *gic)
+{
+    rk3588_touchpad_gic_line = qdev_get_gpio_in(gic, 278);
+}
+
+static void rk3588_create_usb(DeviceState *gic)
+{
+    DeviceState *dev = qdev_new("sysbus-ohci");
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    DeviceState *kbd;
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, 0xfc840000);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 216));
+
+    kbd = qdev_new("usb-kbd");
+    /* qdev_realize takes the bus itself; set_parent_bus+realize(NULL)
+       trips the !parent_bus assertion. */
+    qdev_realize(kbd, qdev_get_child_bus(dev, "usb-bus.0"), &error_fatal);
+    object_unref(OBJECT(kbd));
 }
 
 static void rk3588_create_display_devices(DeviceState *gic)
@@ -864,6 +899,26 @@ static void rk3588_create_display_devices(DeviceState *gic)
     sysbus_mmio_map(sbd, 0, 0xfde80000);
     for (i = 0; i < ARRAY_SIZE(hdmi_spis); i++) {
         sysbus_connect_irq(sbd, i, qdev_get_gpio_in(gic, hdmi_spis[i]));
+    }
+
+    /*
+     * eDP controllers (rk3588-edp.c): edp0 is the Linux analogix_dp
+     * chain (DT node edp@fdec0000), edp1 is the ./rk firmware's
+     * controller (edp_init(EDP1), hardcoded base).  "strm-valid" gives
+     * each guest the SYS_CTL_3 bit2 polarity it polls for: Linux waits
+     * for SET, the firmware's video-on loop exits while CLEAR.
+     * Neither raises an IRQ (static HPD, all polling).
+     */
+    static const struct { uint64_t base; bool strm; } edps[] = {
+        { 0xfdec0000, true },    /* edp0: analogix_dp */
+        { 0xfded0000, false },   /* edp1: ./rk firmware */
+    };
+    for (i = 0; i < ARRAY_SIZE(edps); i++) {
+        dev = qdev_new(TYPE_RK3588_EDP);
+        qdev_prop_set_bit(dev, "strm-valid", edps[i].strm);
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, edps[i].base);
     }
 }
 
@@ -1134,6 +1189,8 @@ static void rk3588_init(MachineState *ms)
     rk3588_connect_gic(ms, gic);
     rk3588_create_uarts(gic);
     rk3588_create_i2cs(gic);
+    rk3588_create_input(gic);
+    rk3588_create_usb(gic);
     rk3588_create_display_devices(gic);
     rk3588_create_timer(gic);
     rk3588_create_dmacs(gic);

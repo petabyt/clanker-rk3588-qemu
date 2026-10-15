@@ -19,17 +19,29 @@ index 4445f16..317c847 100644
      bool
      default y
 diff --git a/hw/arm/meson.build b/hw/arm/meson.build
-index bcc068d..d2032ed 100644
+index bcc068d..0876d84 100644
 --- a/hw/arm/meson.build
 +++ b/hw/arm/meson.build
 @@ -12,6 +12,7 @@ arm_common_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx.c', 'npcm7xx_b
  arm_common_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm8xx.c', 'npcm8xx_boards.c'))
  arm_common_ss.add(when: 'CONFIG_REALVIEW', if_true: files('realview.c'))
  arm_common_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa-ref.c'))
-+arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c', 'rk3588/rk3588-i2c.c'))
++arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c', 'rk3588/rk3588-i2c.c', 'rk3588/rk3588-i2chid.c'))
  arm_common_ss.add(when: 'CONFIG_STELLARIS', if_true: files('stellaris.c'))
  arm_common_ss.add(when: 'CONFIG_STM32VLDISCOVERY', if_true: files('stm32vldiscovery.c'))
  arm_common_ss.add(when: 'CONFIG_ZYNQ', if_true: files('xilinx_zynq.c'))
+diff --git a/hw/arm/trace-events b/hw/arm/trace-events
+index 1b16f71..1054c38 100644
+--- a/hw/arm/trace-events
++++ b/hw/arm/trace-events
+@@ -96,3 +96,7 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
+ 
+ # bcm2838.c
+ bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
++
++# rk3588/rk3588-edp.c
++rk3588_edp_aux(const char *bus, const char *op, uint32_t addr, uint32_t len, uint32_t status) "AUX %s %s addr=0x%03x len=%u status=%u"
++rk3588_edp_dpcd_write(uint32_t addr, uint32_t val) "DPCD[0x%03x] <- 0x%02x"
 diff --git a/hw/sd/sd.c b/hw/sd/sd.c
 index b1b3b12..56c0162 100644
 --- a/hw/sd/sd.c
@@ -180,6 +192,21 @@ index f9282a9..0b92e76 100644
  #define EXT_CSD_FLUSH_CACHE             32      /* W */
  #define EXT_CSD_CACHE_CTRL              33      /* R/W */
  #define EXT_CSD_POWER_OFF_NOTIFICATION  34      /* R/W */
+diff --git a/hw/usb/hcd-ohci.c b/hw/usb/hcd-ohci.c
+index 5e5fe41..2c0897f 100644
+--- a/hw/usb/hcd-ohci.c
++++ b/hw/usb/hcd-ohci.c
+@@ -1728,6 +1728,10 @@ static void ohci_mem_write(void *opaque,
+ 
+         if (ohci->status & OHCI_STATUS_HCR) {
+             ohci_soft_reset(ohci);
++            /* HCR is self-clearing: the HC drops it when the reset is
++             * done.  Without this the Linux ohci driver polls
++             * HcCommandStatus forever ("USB HC reset timed out"). */
++            ohci->status &= ~OHCI_STATUS_HCR;
+         }
+         break;
+ 
 diff --git a/target/arm/helper.c b/target/arm/helper.c
 index ff0b766..149ed76 100644
 --- a/target/arm/helper.c

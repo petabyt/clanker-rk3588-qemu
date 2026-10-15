@@ -10,26 +10,26 @@
  *    mask half itself is never stored (reads return 0 there).  Register
  *    sequences that configure one field at a time rely on this.
  *
- *  - plain read/write blocks: VOP2/eDP/PWM/PHY combo.  Firmware does
+ *  - plain read/write blocks: VOP2-gamma/PWM/PHY combo.  Firmware does
  *    read-modify-write (|=/&=) on these, so masked semantics would turn
  *    every update into a no-op.
  *
  * A few status registers need read hooks so firmware polls terminate:
  *  - CRU  PLL CON6 (V0PLL +0x178, PPLL +0x218): bit15 = PLL locked
  *  - PMU  +0x4000: SoC version, must read 0x3588
- *  - eDP  sys_ctl_1 0x600 bit2 DET_STA, sys_ctl_3 0x608 bit6 HPD,
- *        dp_debug_ctl 0x6c0 bit4 PLL lock
  *  - OTP  0x84 INT_ST bit1 RD_DONE (U-Boot cpuid read)
  *  - TRNG 0xf0 VERSION = 0x46bc, 0x14 ISTAT bit0 RAND_RDY (U-Boot RNG)
+ *  (the eDP status hooks - DET_STA/HPD/PLL-lock - moved into the real
+ *   eDP device model, src/rk3588-edp.c, which now owns both windows.)
  * Everything else reads back what was written (power-gate status reads
- * as 0 => "already on" fast path; CHA_STA / STRM_VALID read as 0 =>
- * success).
+ * as 0 => "already on" fast path).
  *
  * Non-QOM by design: these are anonymous register files with no
  * behaviour, all machine wiring stays in rk3588.c.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/memory.h"
 #include "system/runstate.h"
@@ -281,22 +281,6 @@ static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
     }
     if (off == 0x81f0 || off == 0x8290) {
         return 0xffffffffu;
-    }
-    return stored;
-}
-
-static uint64_t rk_stub_edp_read(uint32_t stored, hwaddr off)
-{
-    switch (off) {
-    case 0x600:
-        stored |= 1u << 2;     /* DET_STA */
-        break;
-    case 0x608:
-        stored |= 1u << 6;     /* HPD */
-        break;
-    case 0x6c0:
-        stored |= 1u << 4;     /* PLL lock */
-        break;
     }
     return stored;
 }
@@ -585,6 +569,74 @@ static uint64_t rk_stub_gpio0_read(uint32_t stored, hwaddr off)
     return stored;
 }
 
+/* --- GPIO1: genbook touchpad line (GPIO1_PD6, hid-over-i2c IRQ) ---------
+ * gpio1 is modelled plain-RW (not hiword): the kernel's gpio-rockchip
+ * does plain readl/writel RMW, and hiword semantics cannot express
+ * enable-bits >= 16 (PD6 = bit 30).  Firmware-style writes to pins 0-15
+ * keep the same low-bit state either way.  Pin 30 idles HIGH (pull-up),
+ * goes LOW while the touchpad has an input report pending; EXT_PORT
+ * (0x50) reads it back so the level-low GPIO irq handler passes.
+ */
+static uint32_t rk_gpio1_pins = 0xffffffffu;   /* all inputs idle high */
+
+qemu_irq rk3588_touchpad_gic_line;          /* GIC SPI 278, set by machine */
+
+/*
+ * The touchpad line is PULSED: assert on event, auto-release after 1 ms
+ * of guest time.  Holding it until the guest reads (real-device style)
+ * deadlocks on this model: the rockchip demux cascades in IRQ context,
+ * the level line keeps re-firing the GIC (6M+ IRQ loops observed), and
+ * the i2c-hid THREADED handler that would read (and deassert) never gets
+ * scheduled.  The pulse lets the cascade run once, then the scheduler
+ * runs the thread, which still finds the queued report/reset data (the
+ * slave serves pending frames regardless of the line).
+ */
+static QEMUTimer *tp_line_timer;
+
+static void tp_line_release(void *opaque)
+{
+    rk_gpio1_pins |= 1u << 30;
+    if (rk3588_touchpad_gic_line) {
+        qemu_set_irq(rk3588_touchpad_gic_line, 0);
+    }
+}
+
+void rk3588_touchpad_set_line(int level)
+{
+    if (!level) {
+        tp_line_release(NULL);
+        return;
+    }
+    rk_gpio1_pins &= ~(1u << 30);
+    if (rk3588_touchpad_gic_line) {
+        qemu_set_irq(rk3588_touchpad_gic_line, level);
+        if (!tp_line_timer) {
+            tp_line_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         tp_line_release, NULL);
+        }
+        timer_mod(tp_line_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000); /* 1ms */
+    }
+}
+
+static uint64_t rk_stub_gpio1_read(uint32_t stored, hwaddr off)
+{
+    if (off == 0x70) {          /* v2 GPIO_EXT_PORTA: live pin inputs */
+        return rk_gpio1_pins;
+    }
+    if (off == 0x50) {
+        /* v2 INT_STATUS: level-low pending = input low.  The rockchip
+         * irq demux reads it to find active pins; without pending bits
+         * it cascades nothing, never clears the touchpad line, and the
+         * GIC re-fires forever (the IRQ storm seen in bring-up). */
+        return ~rk_gpio1_pins;
+    }
+    if (off == 0x78) {          /* v2 version id -> bank uses the v2 map */
+        return 0x01000c2b;      /* GPIO_TYPE_V2 */
+    }
+    return stored;
+}
+
 /*
  * DesignWare SDHCI (eMMC, sdhci@fe2b0000) used by EDK2's DwcSdhciDxe +
  * generic SdMmcPciHcDxe.  The controller must look idle and "done" so the
@@ -853,7 +905,12 @@ static const RkStubBlock rk_stub_blocks[] = {
     { .name = "gpio0", .base = 0xfd8a0000, .size = 0x1000, .hiword = true,
       .read_hook = rk_stub_gpio0_read,
       .write_hook = rk_stub_atf_poweroff_write },
-    MK_MASK("gpio1", 0xfec20000),
+    /* gpio1: HIWORD (native rockchip-v2 write style: each 32-bit half
+     * stores only its low16 data, which is exactly what gpio_writel_v2
+     * expects — plain storage keeps the 0xffff masks and corrupts
+     * gpio_readl_v2) + live EXT_PORT/version hooks for the touchpad. */
+    { .name = "gpio1", .base = 0xfec20000, .size = 0x1000, .hiword = true,
+      .read_hook = rk_stub_gpio1_read },
     MK_MASK("gpio2", 0xfec30000),
     MK_MASK("gpio3", 0xfec40000),
     MK_MASK("gpio4", 0xfec50000),
@@ -986,17 +1043,19 @@ static const RkStubBlock rk_stub_blocks[] = {
     { .name = "dwc3-1", .base = 0xfc400000, .size = 0x400000 },
     { .name = "dwc3-2", .base = 0xfcd00000, .size = 0x400000 },
     { .name = "ehci0", .base = 0xfc800000, .size = 0x40000 },
-    { .name = "ohci0", .base = 0xfc840000, .size = 0x40000 },
+    /* ohci0 (0xfc840000) stub REMOVED: the tiny-core-linux input work
+     * instantiates QEMU's real sysbus OHCI there (stubs map after
+     * devices and shadow them — P11 lesson).  Consumers that merely
+     * read the window now see real OHCI registers instead of storage,
+     * so no invalid-access regressions. */
     { .name = "ehci1", .base = 0xfc880000, .size = 0x40000 },
     { .name = "ohci1", .base = 0xfc8c0000, .size = 0x40000 },
     /* VOP2 (vop@fdd90000): real model, rk3588-vop2.c; gamma-LUT
        window (reg "gamma-lut" 0xfdd95000/0x1000) is plain storage —
        written only when userspace installs a LUT. */
     { .name = "vop2-gamma", .base = 0xfdd95000, .size = 0x1000 },
-    { .name = "edp0", .base = 0xfdec0000, .size = 0x1000,
-      .read_hook = rk_stub_edp_read },
-    { .name = "edp1", .base = 0xfded0000, .size = 0x1000,
-      .read_hook = rk_stub_edp_read },
+    /* eDP0/eDP1 (edp@fdec0000 / edp@fded0000): real Analogix models,
+        rk3588-edp.c (register hooks + AUX/DPCD/EDID engine, P17) */
     /* 0x2000 per u-boot rockchip,rk3588-hdptx-phy.yaml reg size;
         RockchipHdptxPhyReset touches offsets up to 0x1804.
        LNTOP_REG(0207) @0x81c writes feed the hdptx GRF STATUS model

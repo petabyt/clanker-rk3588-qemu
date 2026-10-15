@@ -44,6 +44,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "rk3588-i2c.h"
+#include "rk3588-i2chid.h"
 
 #define RK_I2C_REG_WINDOW  0x1000
 
@@ -93,6 +94,7 @@ struct RkI2cState {
     uint8_t  rxbuf[32];
 
     bool has_rtc;                 /* serve the HYM8563 at 0x51 */
+    bool has_touchpad;            /* serve hid-over-i2c @0x2c (i2c5) */
 };
 
 static void rk_i2c_update_irq(struct RkI2cState *s)
@@ -205,6 +207,17 @@ static void rk_i2c_do_tx(struct RkI2cState *s, uint32_t cnt)
             return;
         }
         rk_i2c_raise(s, REG_INT_MBTF);
+    } else if (s->has_touchpad && addr == RK_I2CHID_ADDR) {
+        /* hid-over-i2c registers are 2-byte LE: reg16 = txbuf[1]|txbuf[2]<<8,
+           payload follows (0 bytes for a pure register-select write). */
+        unsigned int reg16 = (cnt > 2) ? (reg | ((unsigned)s->txbuf[2] << 8))
+                                       : reg;
+        unsigned int plen = (cnt > 3) ? cnt - 3 : 0;
+        if (!rk_i2chid_write(reg16, &s->txbuf[3], plen)) {
+            rk_i2c_raise(s, REG_INT_NAKRCV);
+            return;
+        }
+        rk_i2c_raise(s, REG_INT_MBTF);
     } else {
         rk_i2c_raise(s, REG_INT_NAKRCV);
     }
@@ -222,6 +235,17 @@ static void rk_i2c_do_rx(struct RkI2cState *s, uint32_t cnt)
     memset(s->rxbuf, 0, sizeof(s->rxbuf));
     if (s->has_rtc && addr == HYM8563_ADDR) {
         if (!rk_i2c_slave_read(s, addr, reg, s->rxbuf, cnt)) {
+            rk_i2c_raise(s, REG_INT_NAKRCV);
+            return;
+        }
+        rk_i2c_raise(s, REG_INT_MBRF);
+    } else if (s->has_touchpad && addr == RK_I2CHID_ADDR) {
+        /* `reg` is mrxraddr & 0xff = LOW byte of the 2-byte LE register;
+           all hid-over-i2c registers used here are < 0x100.  A plain
+           read (probe byte / i2c_master_recv input frame) lands here
+           with a stale/zero reg — the slave serves the input frame
+           first regardless of reg. */
+        if (!rk_i2chid_read(reg, s->rxbuf, cnt)) {
             rk_i2c_raise(s, REG_INT_NAKRCV);
             return;
         }
@@ -348,10 +372,15 @@ static void rk_i2c_realize(DeviceState *dev, Error **errp)
                           "rk3588.i2c", RK_I2C_REG_WINDOW);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+
+    if (s->has_touchpad) {
+        rk_i2chid_setup(dev);       /* input handler for the touchpad */
+    }
 }
 
 static const Property rk_i2c_props[] = {
     DEFINE_PROP_BOOL("has-rtc", struct RkI2cState, has_rtc, false),
+    DEFINE_PROP_BOOL("has-touchpad", struct RkI2cState, has_touchpad, false),
 };
 
 static void rk_i2c_class_init(ObjectClass *oc, const void *data)

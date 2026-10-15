@@ -2,6 +2,7 @@
 #define RK3588_STUBS_H
 
 #include "system/memory.h"
+#include "hw/core/irq.h"
 
 /*
  * Register-file stubs for the RK3588 blocks the ./rk firmware pokes
@@ -22,5 +23,15 @@ extern bool rk3588_atf_mode;
  * core_pm_sft_wakeup_en to PMU2_CPU_AUTO_PWR_CON(cpu) (CPU_ON, perf.md A2).
  */
 void rk3588_pmu_cpu_wake(int cpu_index);
+
+/*
+ * Genbook touchpad line (hid-over-i2c @ i2c5 -> GPIO1_PD6 -> SPI 278).
+ * Set by rk3588.c (the GIC input); driven by the i2c-hid slave via
+ * rk3588_touchpad_set_line(): pin 30 of gpio1 goes low while a report
+ * is pending, and the GIC line follows (level, dts IRQ_TYPE_LEVEL_LOW
+ * at the pin / LEVEL_HIGH at the bank).
+ */
+extern qemu_irq rk3588_touchpad_gic_line;
+void rk3588_touchpad_set_line(int level);
 
 #endif
