@@ -219,6 +219,11 @@
 					reg = <2>;
 					remote-endpoint = <&hdmi0_in_vp0>;
 				};
+
+				vp0_out_edp0: endpoint@3 {
+					reg = <3>;	/* ROCKCHIP_VOP2_EP_EDP0 */
+					remote-endpoint = <&edp0_in_vp0>;
+				};
 			};
 		};
 	};
@@ -273,6 +278,53 @@
 		port {
 			hdmi0_con_in: endpoint {
 				remote-endpoint = <&hdmi0_out_con>;
+			};
+		};
+	};
+
+	/*
+	 * P17 eDP0 (analogix_dp): disabled by default so run-linux keeps
+	 * the HDMI-only pipeline; make run-linux-edp derives its DTB with
+	 * fdtput (edp0 status=okay, hdmi0 status=disabled).  IDs from
+	 * include/dt-bindings/{clock,reset}/rockchip,rk3588-cru.h:
+	 * PCLK_EDP0=511, CLK_EDP0_24M=512 ("dp"), HCLK_VO1=717,
+	 * SRST_P_EDP0=468 ("dp" reset), SRST_EDP0_24M=469 ("apb").
+	 * Raw cells: GIC_SPI=0, IRQ_TYPE_LEVEL_HIGH=4;
+	 * ROCKCHIP_VOP2_EP_EDP0=3 (dt-bindings/soc/rockchip,vop2.h).
+	 * The analogix_dp core requires phy "dp" (hdptxphy0, shared with
+	 * hdmi0 - only one of the two nodes is enabled per boot), both
+	 * resets (the "dp" one is non-optional in rockchip_dp_of_probe),
+	 * and platform_get_irq() on SPI 163 - the QEMU model never
+	 * asserts it (static HPD, everything is polled).  No
+	 * power-domains (none of the model's devices model a PD).
+	 */
+	edp0: edp@fdec0000 {
+		compatible = "rockchip,rk3588-edp";
+		reg = <0x0 0xfdec0000 0x0 0x1000>;
+		clocks = <&cru 512>, <&cru 511>, <&cru 717>;
+		clock-names = "dp", "pclk", "hclk";
+		interrupts = <0 163 4>;
+		phys = <&hdptxphy0>;
+		phy-names = "dp";
+		resets = <&cru 469>, <&cru 468>;
+		reset-names = "dp", "apb";
+		rockchip,grf = <&vo1_grf>;
+		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				edp0_in_vp0: endpoint {
+					remote-endpoint = <&vp0_out_edp0>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;	/* no downstream bridge */
 			};
 		};
 	};

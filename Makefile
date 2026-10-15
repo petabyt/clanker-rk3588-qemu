@@ -31,7 +31,7 @@ APPIMG_DESKTOP := packaging/rk3588-qemu.desktop
 APPIMG_ICON   := packaging/rk3588-qemu.png
 
 .PHONY: all qemu rk appimage run-sd trace-sd regress sd-own-bl31 sd-v116 run-v116 \
-	run-linux linux-initramfs linux-dtb clean distclean help
+	run-linux run-linux-edp linux-initramfs linux-dtb clean distclean help
 
 all: qemu rk
 
@@ -56,7 +56,7 @@ $(QEMU_BUILD)/config.status: $(QEMU_DIR)/configure $(QEMU_PATCH) \
 		echo "$(QEMU_PATCH): already applied"; \
 	else \
 		echo "ERROR: $(QEMU_PATCH) is out of sync with ./qemu." >&2; \
-		echo "Regenerate it: git -C $(QEMU_DIR) diff -- hw/arm/Kconfig hw/arm/meson.build hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdhci-internal.h hw/sd/sdmmc-internal.h target/arm/helper.c > $(QEMU_PATCH)" >&2; \
+		echo "Regenerate it: git -C $(QEMU_DIR) diff -- hw/arm/Kconfig hw/arm/meson.build hw/arm/trace-events hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdhci-internal.h hw/sd/sdmmc-internal.h target/arm/helper.c > $(QEMU_PATCH)" >&2; \
 		exit 1; \
 	fi
 	@mkdir -p $(QEMU_BUILD)
@@ -242,6 +242,47 @@ run-linux: $(QEMU_BIN) $(LINUX_DTB) $(INITRD_BIN) images/emmc.img
 		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-int.log \
 		> $(LOG_DIR)/run-linux.txt 2>&1
 	@tr -d '\r' < $(LOG_DIR)/run-linux.txt | grep -a "LINUX-OK\|Run /init\|Kernel panic\|dw-apb-uart\|Starting kernel" || true
+
+# P17: eDP-only DTB, derived from the base DTB with fdtput so run-linux
+# keeps shipping the unmodified images/rk3588-qemu.dtb (edp0 stays
+# status="disabled" in the source DTS, hdmi0 stays "okay").
+# The extra dtc round-trip deletes the vop's hdmi endpoint node: vop2's
+# CRTC creation calls of_graph_get_remote_node(vp0, -1), which returns
+# the FIRST endpoint child and then rejects it because its remote
+# (hdmi0) is status=disabled here -> 0 CRTCs, "Bogus possible_crtcs",
+# fbdev "Cannot find any crtc or sizes".  With the hdmi endpoint gone
+# the first (only) child is endpoint@3 -> remote edp0 (okay) -> vp0
+# crtc created.  The base DTB keeps both endpoints; hdmi0's remote
+# stays available there, so run-linux is unaffected.
+EDP_DTB := images/rk3588-qemu-edp.dtb
+$(EDP_DTB): linux-dtb $(LINUX_DTB)
+	cp $(LINUX_DTB) $(EDP_DTB)
+	fdtput -t s $(EDP_DTB) /edp@fdec0000 status okay
+	fdtput -t s $(EDP_DTB) /hdmi@fde80000 status disabled
+	dtc -I dtb -O dts -o /tmp/opencode/edp-dec.dts $(EDP_DTB)
+	python3 scripts/edp-drop-hdmi-ep.py /tmp/opencode/edp-dec.dts /tmp/opencode/edp-fix.dts
+	dtc -Wno-unit_address_vs_reg -I dts -O dtb -o /tmp/opencode/edp-fix.dtb /tmp/opencode/edp-fix.dts
+	python3 -c "d=open('/tmp/opencode/edp-fix.dtb','rb').read(); \
+	assert len(d) <= 0x20000, 'edp dtb too big'; \
+	open('$(EDP_DTB)','wb').write(d+b'\0'*(0x20000-len(d)))"
+
+# P17: same boot as run-linux but on the analogix_dp eDP chain, with the
+# QEMU model's AUX/DPCD trace captured for the exit evidence.
+run-linux-edp: $(QEMU_BIN) $(EDP_DTB) $(INITRD_BIN) images/emmc.img
+	mkdir -p $(LOG_DIR)
+	rm -f $(LOG_DIR)/run-linux-edp-trace.log
+	-timeout 130 $(QEMU_RK3588) \
+		-bios atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
+		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
+		-device loader,file=$(EDP_DTB),addr=0x0a100000,force-raw=on \
+		-dtb u-boot/dts/dt.dtb \
+		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
+		-trace enable=rk3588_edp_*,file=$(LOG_DIR)/run-linux-edp-trace.log \
+		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-edp-int.log \
+		> $(LOG_DIR)/run-linux-edp.txt 2>&1
+	@tr -d '\r' < $(LOG_DIR)/run-linux-edp.txt | grep -a "LINUX-OK\|Run /init\|Kernel panic\|analogix\|Console: switching\|bound fdec0000\|Starting kernel" || true
 
 sd-own-bl31: $(QEMU_BIN) $(OWN_BL31_SD)
 	-timeout $(SD_TIMEOUT) $(QEMU_RK3588) \
