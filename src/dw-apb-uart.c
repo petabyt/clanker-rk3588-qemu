@@ -147,7 +147,11 @@ static void dw_uart_update_msr(DWUartState *s)
 
 static void dw_uart_tx(DWUartState *s, uint8_t c)
 {
-    if (qemu_chr_fe_backend_connected(&s->chr)) {
+    if (s->mcr & DW_MCR_LOOP) {
+        if (s->rx_count < DW_UART_RX_FIFO) {
+            s->rx_fifo[s->rx_count++] = c;
+        }
+    } else if (qemu_chr_fe_backend_connected(&s->chr)) {
         qemu_chr_fe_write_all(&s->chr, &c, 1);
     }
     /* The transmit path is modelled as instant, so THR is empty again. */
@@ -337,7 +341,7 @@ static int dw_uart_can_receive(void *opaque)
 {
     DWUartState *s = opaque;
 
-    return s->rx_count < DW_UART_RX_FIFO;
+    return !(s->mcr & DW_MCR_LOOP) && s->rx_count < DW_UART_RX_FIFO;
 }
 
 static void dw_uart_receive(void *opaque, const uint8_t *buf, int size)

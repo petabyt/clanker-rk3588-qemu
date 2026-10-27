@@ -12,11 +12,10 @@
  *
  * The kernel uses it for BOTH a clocksource + sched_clock (reads
  * CURRENT_VALUE as a free-running 32-bit down-counter at the "timer"
- * clock rate) and a fallback clock-event (rating 250, arch_timer at
- * rating 400 wins on real boards).  The count is therefore computed
- * from the QEMU virtual clock on read instead of ticking a ptimer:
- * a 24 MHz timer would burn the host on timer callbacks while the
- * guest only ever polls the register.
+ * clock rate) and a broadcast clock-event while CPU idle stops the
+ * local architectural timers.  CURRENT_VALUE is computed from virtual
+ * time; a QEMUTimer callback at each expiry delivers interrupts without
+ * requiring any guest register reads or ticking at the input clock rate.
  */
 #ifndef RK3588_TIMER_H
 #define RK3588_TIMER_H

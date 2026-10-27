@@ -19,10 +19,37 @@ void rk3588_create_stub_regions(MemoryRegion *sysmem);
 extern bool rk3588_atf_mode;
 
 /*
+ * PCIe link state reported by the APB client's LTSSM_STATUS (+0x300).
+ * Default true (the P10 stock-EDK2 path needs link-up so segment init
+ * completes at once); the Linux audit runs pass -M rk3588,pcie-link=off
+ * to model the empty slot the VM actually has, which makes
+ * dw_pcie_wait_for_link() report "Device not found" / -ENODEV instead of
+ * inventing a Gen.0 x0 link.  Set by rk3588.c before stub init.
+ */
+extern bool rk3588_pcie_link_up;
+
+/*
  * Machine hook (rk3588.c): the PMU stub calls this when TF-A writes
  * core_pm_sft_wakeup_en to PMU2_CPU_AUTO_PWR_CON(cpu) (CPU_ON, perf.md A2).
  */
 void rk3588_pmu_cpu_wake(int cpu_index);
+
+/*
+ * Machine hook (rk3588.c), P20: the modelled PMU core power-cycle for
+ * PSCI CPU_SUSPEND.  Same reset-into-pmusram sequence as CPU_ON, but
+ * valid for every core (the boot core suspends too) and repeatable, so it
+ * bypasses the "already on" bookkeeping of rk3588_pmu_cpu_wake().
+ */
+void rk3588_pmu_cpu_resume(int cpu_index);
+void rk3588_pmu_cpu_suspend(int cpu_index);
+bool rk3588_pmu_cpu_has_wakeup(int cpu_index);
+
+/*
+ * Called from the machine's reset handler: drop any suspend-wake requests
+ * that were armed before the reset (after a reset the secondaries are
+ * start-powered-off again and must not be woken without a CPU_ON).
+ */
+void rk3588_pmu_suspend_reset(void);
 
 /*
  * Genbook touchpad line (hid-over-i2c @ i2c5 -> GPIO1_PD6 -> SPI 278).

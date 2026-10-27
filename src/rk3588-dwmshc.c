@@ -10,12 +10,13 @@
  *  - Data: IDMAC (CTRL.IDMAC_EN, 32-bit chained descriptors, processed
  *    synchronously when the command is issued) and PIO (FIFO at 0x200).
  *  - Card detect (CDETECT) and write protect (WRTPRT) come from the card.
- *  - No interrupts (polled); no clock modelling (CLKDIV/CLKENA stored).
+ *  - Level-high interrupt output; CLKDIV/CLKENA are stored, not modelled.
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/sd/sd.h"
 #include "system/memory.h"
 #include "system/dma.h"
@@ -57,7 +58,7 @@ bool rk3588_sd_card_inserted;
 #define DSCADDR     0x094
 #define BUFADDR     0x098
 
-#define REGS_BYTES  0x100   /* control/status register file */
+#define REGS_BYTES  0x114   /* through ENABLE_SHIFT; FIFO remains at 0x200 */
 
 /* CTRL */
 #define CTRL_RESET        (1u << 0)
@@ -105,6 +106,7 @@ typedef struct RK3588DwMshcState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     SDBus sdbus;
+    qemu_irq irq;
     uint32_t regs[REGS_BYTES / 4];
     uint32_t data_left;     /* PIO bytes still to move */
     bool data_write;        /* PIO direction: host -> card */
@@ -113,6 +115,21 @@ typedef struct RK3588DwMshcState {
 } RK3588DwMshcState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(RK3588DwMshcState, RK3588_DWMSHC)
+
+/*
+ * Level-high IRQ out: asserted while any *unmasked* RINTSTS bit is set.
+ * The DT wires mmc@fe2c0000 as SPI 203 LEVEL_HIGH.
+ *
+ * U-Boot SPL polls RINTSTS, whereas Linux's dw_mmc uses interrupts.
+ * Both paths share the same latched status and interrupt mask.
+ */
+static void dwmshc_update_irq(RK3588DwMshcState *s)
+{
+    if (s->irq) {
+        qemu_set_irq(s->irq,
+                     (s->regs[RINTSTS / 4] & s->regs[INTMASK / 4]) != 0);
+    }
+}
 
 static void dwmshc_reset(DeviceState *dev)
 {
@@ -128,6 +145,7 @@ static void dwmshc_reset(DeviceState *dev)
      * media-change events, so take the state from the bus here.
      */
     rk3588_sd_card_inserted = sdbus_get_inserted(&s->sdbus);
+    dwmshc_update_irq(s);
 }
 
 static void dwmshc_set_data_done(RK3588DwMshcState *s)
@@ -147,6 +165,7 @@ static void dwmshc_set_data_done(RK3588DwMshcState *s)
         s->autostop = false;
         s->regs[RINTSTS / 4] |= INT_ACD;
     }
+    dwmshc_update_irq(s);
 }
 
 /*
@@ -160,6 +179,7 @@ static void dwmshc_fifo_request(RK3588DwMshcState *s)
         return;
     }
     s->regs[RINTSTS / 4] |= s->data_write ? INT_TXDR : INT_RXDR;
+    dwmshc_update_irq(s);
 }
 
 /* Byte-wise card access: sdbus_read_data asserts on a zero-length read. */
@@ -258,6 +278,7 @@ static void dwmshc_data_start(RK3588DwMshcState *s, uint32_t cmd)
         return;
     }
     s->regs[RINTSTS / 4] |= write ? INT_TXDR : INT_RXDR;
+    dwmshc_update_irq(s);
 }
 
 static void dwmshc_command(RK3588DwMshcState *s, uint32_t cmd)
@@ -295,6 +316,7 @@ static void dwmshc_command(RK3588DwMshcState *s, uint32_t cmd)
     if ((cmd & CMD_DATA_EXP) && (rlen > 0 || !expect)) {
         dwmshc_data_start(s, cmd);
     }
+    dwmshc_update_irq(s);
 }
 
 static uint32_t dwmshc_fifo_read(RK3588DwMshcState *s)
@@ -376,7 +398,7 @@ static uint64_t rk3588_dwmshc_read(void *opaque, hwaddr off, unsigned size)
         val = VERID_VALUE;
         break;
     case HCON:
-        val = 0;
+        val = 1u << 7;  /* 32-bit FIFO accesses, matching DATA's word size */
         break;
     default:
         val = s->regs[off / 4];
@@ -403,14 +425,19 @@ static void rk3588_dwmshc_write(void *opaque, hwaddr off, uint64_t value,
 
     switch (off) {
     case CTRL:
-        if (val & CTRL_RESET) {
-            dwmshc_reset(DEVICE(s));
-        }
+        /*
+         * CTRL reset bits reset the engines, not the register bank.
+         * In particular Linux resets the engines on MMC_POWER_OFF after
+         * configuring INTMASK; erasing it here masks every later command.
+         * Only the QOM reset above resets configuration registers.
+         */
         /* Self-clearing reset bits. */
         s->regs[CTRL / 4] = val & ~(CTRL_RESET | CTRL_FIFO_RESET |
                                     CTRL_DMA_RESET);
-        if (val & (CTRL_FIFO_RESET | CTRL_DMA_RESET)) {
+        if (val & (CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET)) {
             s->data_left = 0;
+            s->autostop = false;
+            s->stop_cmd = false;
         }
         break;
     case CMD:
@@ -443,6 +470,9 @@ static void rk3588_dwmshc_write(void *opaque, hwaddr off, uint64_t value,
         s->regs[off / 4] = val;
         break;
     }
+    /* INTMASK changes and RINTSTS write-1-to-cleared bits re-evaluate
+     * the (masked) IRQ level - including the deassert on ack. */
+    dwmshc_update_irq(s);
 }
 
 static const MemoryRegionOps rk3588_dwmshc_ops = {
@@ -476,6 +506,7 @@ static void rk3588_dwmshc_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &rk3588_dwmshc_ops, s,
                           TYPE_RK3588_DWMSHC, RK3588_SDMMC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 }
 
 static void rk3588_dwmshc_class_init(ObjectClass *klass, const void *data)

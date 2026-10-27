@@ -31,11 +31,20 @@ APPIMG_DESKTOP := packaging/rk3588-qemu.desktop
 APPIMG_ICON   := packaging/rk3588-qemu.png
 
 .PHONY: all qemu rk appimage run-sd trace-sd regress sd-own-bl31 sd-v116 run-v116 \
-	run-linux run-linux-edp linux-initramfs linux-dtb clean distclean help
+	run-linux run-linux-edp linux-initramfs linux-dtb all-dtb clean distclean help \
+	run-opi5-raw test-boot-devices
 
 all: qemu rk
 
 qemu: $(QEMU_BIN)
+
+# P20: disk-resident firmware and autoboot only; no serial input or loaders.
+OPI5_RAW_TIMEOUT ?= 1500
+run-opi5-raw: qemu
+	python3 scripts/run-opi5-raw.py --qemu $(QEMU_BIN) --fresh --timeout $(OPI5_RAW_TIMEOUT)
+
+test-boot-devices: qemu
+	python3 scripts/test-rk-boot-devices.py --qemu $(QEMU_BIN)
 
 # The symlink must exist before meson parses hw/arm/meson.build.
 $(QEMU_SYMLINK):
@@ -56,7 +65,7 @@ $(QEMU_BUILD)/config.status: $(QEMU_DIR)/configure $(QEMU_PATCH) \
 		echo "$(QEMU_PATCH): already applied"; \
 	else \
 		echo "ERROR: $(QEMU_PATCH) is out of sync with ./qemu." >&2; \
-		echo "Regenerate it: git -C $(QEMU_DIR) diff -- hw/arm/Kconfig hw/arm/meson.build hw/arm/trace-events hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdhci-internal.h hw/sd/sdmmc-internal.h target/arm/helper.c > $(QEMU_PATCH)" >&2; \
+		echo "Regenerate it: git -C $(QEMU_DIR) diff -- hw/arm/Kconfig hw/arm/meson.build hw/arm/trace-events hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdhci-internal.h hw/sd/sdmmc-internal.h target/arm/helper.c target/arm/cpu.h target/arm/tcg/op_helper.c hw/virtio/virtio-mmio.c hw/usb/hcd-ohci.c ui/console.c > $(QEMU_PATCH)" >&2; \
 		exit 1; \
 	fi
 	@mkdir -p $(QEMU_BUILD)
@@ -199,6 +208,19 @@ $(STOCK_SMP_DTB): images/rk3588s-orangepi-5-stock.dtb
 		fdtput -d $(STOCK_SMP_DTB) /cpus/$$cpu cpu-idle-states 2>/dev/null || true; \
 	done
 
+# P19 (device-coverage pass): the "all devices" Armbian boot DTB - the
+# image's own vendor DTB with every node kept (gpu/NPU/codec/ISP/RGA all
+# still described, so the model has to answer for each of them), eMMC
+# enabled for root=/dev/mmcblk1p1, cpu-idle-states stripped (TF-A
+# CPUECTLR_EL3 UNDEF, see above) and four virtio,mmio transports added at
+# 0xfb200000.  scripts/run-desktop.py boots it; scripts/dtb-coverage.py
+# checks the model's answer for every enabled node.
+ALL_DTB := images/armbian/rk3588s-orangepi-5-all.dtb
+all-dtb: $(ALL_DTB)
+$(ALL_DTB): scripts/mk-all-dtb.py images/armbian/rk3588s-orangepi-5-armbian.dtb
+	python3 scripts/mk-all-dtb.py images/armbian/rk3588s-orangepi-5-armbian.dtb $@ \
+		--dts dts/rk3588s-orangepi-5-all.dts
+
 run-linux-stock: $(QEMU_BIN) $(STOCK_SMP_DTB) $(INITRD_BIN) images/emmc.img
 	mkdir -p $(LOG_DIR)
 	-timeout 290 $(QEMU_RK3588) \
@@ -322,6 +344,9 @@ help:
 	@echo "  qemu    - qemu-system-aarch64 in $(QEMU_BUILD)/"
 	@echo "  rk      - bootloader images via ./rk"
 	@echo "  appimage - portable $(APPIMAGE) (linuxdeploy + appimagetool)"
+	@echo "  all-dtb - P19 'all devices' Armbian boot DTB"
+	@echo "  run-opi5-raw - stock Armbian disk autoboot and serial-login gate"
+	@echo "  test-boot-devices - broadcast timer and SD reset regressions"
 	@echo "  clean   - remove $(BUILD_DIR)/ + $(APPIMAGE)"
 	@echo "  distclean - clean + rk clean"
 

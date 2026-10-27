@@ -1,4 +1,4 @@
-# RK3588 Qemu port
+# rkqemu
 
 Qemu platform support implemented for the RK3588. Goal is to get unmodified Armbian Ubuntu images booting to desktop.
 

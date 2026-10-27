@@ -27,6 +27,7 @@ struct RK3588TimerState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq irq;
+    QEMUTimer *timer;
 
     uint32_t load;
     uint32_t ctrl;
@@ -50,10 +51,7 @@ static uint32_t rk3588_timer_current(RK3588TimerState *s)
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     elapsed = muldiv64(now - s->start_ns, s->freq_hz, 1000000000ULL);
     span = (uint64_t)s->load + 1;
-    if ((s->ctrl & CTRL_MODE_USER_DEFINED) && elapsed >= s->load + 1) {
-        /* One-shot expired: latch pending + drive the IRQ line. */
-        s->int_status |= 1;
-        qemu_set_irq(s->irq, (s->ctrl & CTRL_INT_UNMASK) && (s->int_status & 1));
+    if ((s->ctrl & CTRL_MODE_USER_DEFINED) && elapsed >= span) {
         return 0;
     }
     rem = elapsed % span;
@@ -63,6 +61,40 @@ static uint32_t rk3588_timer_current(RK3588TimerState *s)
 static void rk3588_timer_update_irq(RK3588TimerState *s)
 {
     qemu_set_irq(s->irq, (s->ctrl & CTRL_INT_UNMASK) && (s->int_status & 1));
+}
+
+static uint64_t rk3588_timer_period_ns(RK3588TimerState *s)
+{
+    return DIV_ROUND_UP(((uint64_t)s->load + 1) * 1000000000ULL,
+                        s->freq_hz);
+}
+
+static void rk3588_timer_schedule(RK3588TimerState *s)
+{
+    uint64_t period, now, deadline;
+
+    if (!s->enabled) {
+        timer_del(s->timer);
+        return;
+    }
+    period = rk3588_timer_period_ns(s);
+    deadline = s->start_ns + period;
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (!(s->ctrl & CTRL_MODE_USER_DEFINED) && deadline <= now) {
+        deadline += ((now - deadline) / period + 1) * period;
+    }
+    timer_mod(s->timer, deadline);
+}
+
+static void rk3588_timer_expired(void *opaque)
+{
+    RK3588TimerState *s = opaque;
+
+    s->int_status |= 1;
+    rk3588_timer_update_irq(s);
+    if (!(s->ctrl & CTRL_MODE_USER_DEFINED)) {
+        rk3588_timer_schedule(s);
+    }
 }
 
 static uint64_t rk3588_timer_read(void *opaque, hwaddr off, unsigned size)
@@ -94,6 +126,7 @@ static void rk3588_timer_write(void *opaque, hwaddr off, uint64_t value,
         /* Restart the count from the new load if running. */
         if (s->enabled) {
             s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            rk3588_timer_schedule(s);
         }
         break;
     case REG_CURRENT_VALUE:
@@ -115,6 +148,7 @@ static void rk3588_timer_write(void *opaque, hwaddr off, uint64_t value,
         s->ctrl = value & (CTRL_ENABLE | CTRL_MODE_USER_DEFINED |
                            CTRL_INT_UNMASK);
         rk3588_timer_update_irq(s);
+        rk3588_timer_schedule(s);
         break;
     case REG_INT_STATUS: /* write-1-to-clear */
         s->int_status &= ~value;
@@ -144,6 +178,14 @@ static void rk3588_timer_init(Object *obj)
                           TYPE_RK3588_TIMER, RK3588_TIMER_REGS);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rk3588_timer_expired, s);
+}
+
+static void rk3588_timer_finalize(Object *obj)
+{
+    RK3588TimerState *s = RK3588_TIMER(obj);
+
+    timer_free(s->timer);
 }
 
 static const Property rk3588_timer_properties[] = {
@@ -160,6 +202,8 @@ static void rk3588_timer_reset_hold(Object *obj, ResetType type)
     s->cur_frozen = 0;
     s->enabled = false;
     s->start_ns = 0;
+    timer_del(s->timer);
+    rk3588_timer_update_irq(s);
 }
 
 static void rk3588_timer_class_init(ObjectClass *oc, const void *data)
@@ -178,6 +222,7 @@ static const TypeInfo rk3588_timer_types[] = {
         .parent = TYPE_SYS_BUS_DEVICE,
         .instance_size = sizeof(RK3588TimerState),
         .instance_init = rk3588_timer_init,
+        .instance_finalize = rk3588_timer_finalize,
         .class_init = rk3588_timer_class_init,
     },
 };

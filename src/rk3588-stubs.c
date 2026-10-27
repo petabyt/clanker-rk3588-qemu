@@ -30,6 +30,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "hw/core/cpu.h"
 #include "qom/object.h"
 #include "system/memory.h"
 #include "system/runstate.h"
@@ -40,6 +41,14 @@
 
 typedef uint64_t (*RkStubReadHook)(uint32_t stored, hwaddr off);
 typedef void (*RkStubWriteHook)(hwaddr off, uint64_t value);
+struct RkStub;
+/*
+ * Context-aware variant: some models must derive a read from *other*
+ * registers of the same window (EHCI: USBSTS.HCHalted = !USBCMD.RUN).
+ * The plain hook only sees (stored, off), so give those spans this one.
+ */
+typedef uint64_t (*RkStubReadHook2)(struct RkStub *s, uint32_t stored,
+                                    hwaddr off);
 
 /* Set by rk3588.c when -bios is a TF-A (BL31) ELF; see rk-stubs header. */
 bool rk3588_atf_mode;
@@ -56,6 +65,7 @@ typedef struct RkStubBlock {
     bool hiword;
     bool track_engine;
     RkStubReadHook read_hook;
+    RkStubReadHook2 read_hook2;
     RkStubWriteHook write_hook;
     /* optional power-on value for one register (offset from base) */
     hwaddr reset_off;
@@ -75,6 +85,7 @@ typedef struct RkStub {
     uint8_t *tally;     /* per-64K-block doorbell toggle for +0x514 */
     unsigned tally_n;
     RkStubReadHook read_hook;
+    RkStubReadHook2 read_hook2;
     RkStubWriteHook write_hook;
     hwaddr plain_lo, plain_hi;
 } RkStub;
@@ -110,6 +121,41 @@ static void rk_stub_poweroff_write(hwaddr off, uint64_t value)
  *      mmio_write_32(CRU_BASE + CRU_GLB_SRST_FST, GLB_SRST_FST_CFG_VAL);
  *      -- CRU offset 0xc08, value 0xfdb9 --  then parks in WFI.
  */
+/*
+ * P19 media power-domain rejection (user decision "reject with pd").
+ *
+ * rockchip-pm-domain's own probe must see every domain ON: pm_genpd_init()
+ * computes start_off = !is_on() and pm_genpd_add_subdomain() then returns
+ * -EINVAL for the vdpu->av1 edge (the B3 note below), which rolls the whole
+ * driver back and, worse, leaves genpd half-registered for genpd_debug_init()
+ * to dereference (kernel Oops, PID 1 panic - observed).  So the reject is
+ * armed, never static:
+ *
+ *   rk_pd_pwr_seen      set when rockchip-pm-domain writes a power-control
+ *                       register (0x814c..) - i.e. its probe is running.
+ *                       Firmware (TF-A/u-boot/EDK2) runs before that, so a
+ *                       firmware write can never arm anything.
+ *   rk_pd_media_armed   per repair-status bit: report this domain OFF from
+ *                       now on.  Sources, both safe by construction:
+ *                         - a power-off pattern write of that domain's own
+ *                           pwr mask (probe only writes npu/gpu/vcodec
+ *                           masks 1/2/4; the media masks 0x100/0x200/0x400
+ *                           are only written by rockchip-pm-domain after
+ *                           probe, e.g. genpd "Disabling unused"), or
+ *                         - the rga driver's own SRST writes: rga_parse_dt()
+ *                           (probe line 783) asserts+deasserts the rga2
+ *                           resets (ids 368..370 = bits 0..2 of CRU
+ *                           SOFTRST bank 23 @0xa5c) *before* its
+ *                           pm_runtime_resume_and_get() - and rga cannot
+ *                           probe before the pm-domain provider exists.
+ *   Result: rga's first power-on poll fails after 10 ms with
+ *   "failed to set domain 'vdpu' on" (-ETIMEDOUT) and its probe aborts;
+ *   codecs that only power on at open() fail there instead.  The three
+ *   domains' power-off short-circuits silently once armed.
+ */
+static bool rk_pd_pwr_seen;
+static uint32_t rk_pd_media_armed;
+
 static void rk_stub_atf_poweroff_write(hwaddr off, uint64_t value)
 {
     if (rk3588_atf_mode && off == 0x00 && value == 0x00040004) {
@@ -122,7 +168,139 @@ static void rk_stub_atf_reset_write(hwaddr off, uint64_t value)
     if (rk3588_atf_mode && off == 0xc08 && value == 0xfdb9) {
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
+    /*
+     * SOFTRST register 45 @0xab4 (base RK3588_SOFTRST_CON(0) = 0xa00,
+     * bank 45 * 4): LUT ids 368/369/370 = rga2's ahb/axi/core resets ->
+     * bits 7/8/9 (rst-rk3588.c), written only by rga_parse_dt() inside
+     * rga_probe().  Arm vdpu's reject - but only once rockchip-pm-domain
+     * is demonstrably alive (rk_pd_pwr_seen), so a firmware-time write of
+     * the same bits cannot arm it before pm_genpd_init() has read the
+     * domain as on (that mismatch is what panics genpd_debug_init, see
+     * the state comment).
+     */
+    if (off == 0xab4 && rk_pd_pwr_seen && ((value >> 16) & 0x380)) {
+        rk_pd_media_armed |= 1u << 9;      /* vdpu repair-status bit */
+    }
 }
+
+/*
+ * EHCI (usb@fc800000 / usb@fc880000, linux ehci-platform + generic-ehci).
+ * Storage alone makes probe fail: usb_add_hcd -> ehci_init() first runs
+ * ehci_halt(), which writes USBCMD without RUN and then spins on
+ * USBSTS.STS_HALT until it *reads 1* (2 ms budget), and ehci_reset()
+ * handshakes USBCMD.HCRESET until it self-clears (250 ms).  Later
+ * ehci_run() writes RUN and waits for STS_HALT to read 0.  Model those
+ * exact semantics with per-instance state (read_hook2 sees the window):
+ *   +0x00 hc_capbase  EHCI 1.0 (0x0100) with CAPLENGTH 0x10 (standard
+ *          operational-at-+0x10 layout)
+ *   +0x04 hc_params1   N_PORTS = 1  (0 is rejected by usbcore itself:
+ *          "hub doesn't have any ports!" -ENODEV, so the row's "0 ports"
+ *          becomes one permanently empty port - nothing is connected,
+ *          PORTSC stays 0 and the root hub sits idle)
+ *   +0x10 USBCMD       HCRESET (bit1) reads back cleared (self-clearing)
+ *   +0x14 USBSTS       HCHalted (bit12) == !USBCMD.RUN: halted before the
+ *          run bit, operational after it - both handshakes pass and no
+ *          status/interrupt bits ever appear.
+ * Root-hub enumeration for EHCI is software-side (rh_call_control), so no
+ * host-side IRQ wiring is needed and the DT SPI (0xd7/0xda) stays quiet.
+ */
+static uint64_t rk_stub_ehci_read2(RkStub *s, uint32_t stored, hwaddr off)
+{
+    uint32_t cmd = s->regs[0x10 / 4];
+
+    switch (off) {
+    case 0x00:
+        return 0x01000010;      /* hc_capbase: EHCI 1.0, CAPLENGTH 0x10 */
+    case 0x04:
+        return 0x00000001;      /* hc_params1: N_PORTS = 1 */
+    case 0x10:
+        return cmd & ~0x2u;     /* USBCMD: HCRESET self-clears */
+    case 0x14:
+        return (cmd & 1) ? 0u : (1u << 12);   /* USBSTS: HCHalted == !RUN */
+    }
+    return stored;
+}
+
+/*
+ * dwc3 windows (usb@fc000000 "otg" and usb@fcd00000 "host"): one 4 MB
+ * window, two register files (core.h: xHCI at [0, DWC3_XHCI_REGS_END),
+ * "Globals" from DWC3_GLOBALS_REGS_START 0xc100 - dwc3_readl() subtracts
+ * 0xc100 from the documented offsets, so the define values *are* window
+ * offsets, which is what this hook keys on).
+ *
+ * Guest side after this hook:
+ *   dwc3 core probe: GSNPSID must read the DWC3 ip id 0x5533 (rev 3.30A)
+ *   or core_is_valid() bails with "not a DesignWare USB3 DRD Core";
+ *   dwc3_core_soft_reset() polls DCTL.CSFTRST (bit30) until it self-
+ *   clears (1000 x 1us); init_mode() then takes dr_mode from DT:
+ *     host  -> dwc3_host_init() creates an "xhci-hcd" child whose
+ *              register window is [start, start+0x7fff] of this window;
+ *     otg   -> usb-role-switch property present -> dwc3_setup_role_switch()
+ *              (no partner in this VM, so it idles in device mode).
+ *   xhci-hcd child (space below 0x8000):
+ *     hc_capbase: CAPLENGTH 0x20 + HCI 1.0 (skips HCCPARAMS2 read),
+ *     HCS1 = 1 port / 1 interrupter / 32 slots (xhci->allow_single_roothub
+ *       = 1 on this platform, so no PROTOCOL extended capabilities are
+ *       needed for a single 1-port root hub),
+ *     DBOFF 0x2000, RTSOFF 0x3000 (masks: ~3 and ~0x1f - both fit),
+ *     USBCMD.CMD_RESET self-clears, USBSTS.Halted is **bit 0** (xHCI, not
+ *       EHCI's bit 12) and mirrors !RUN, CNR always clear, page_size 1
+ *       (4 KB).  PORTSC at 0x420 stays 0: root hub up, nothing attached.
+ */
+static uint64_t rk_stub_dwc3_read2(RkStub *s, uint32_t stored, hwaddr off)
+{
+    if (off < 0x8000) {
+        uint32_t cmd = s->regs[0x20 / 4];   /* operational USBCMD @0x20 */
+
+        switch (off) {
+        case 0x00:
+            return 0x01000020;  /* CAPLENGTH 0x20, HCI version 1.0 */
+        case 0x04:
+            return (2u << 24) | (1u << 8) | 32;  /* HCS1: 2 ports, 1 intr, 32 slots */
+        case 0x14:
+            return 0x2000;      /* DBOFF: doorbell array (4-aligned) */
+        case 0x18:
+            return 0x3000;      /* RTSOFF: runtime regs (32-aligned) */
+        case 0x20:
+            return cmd & ~0x2u; /* USBCMD: CMD_RESET self-clears */
+        case 0x24:
+            return (cmd & 1) ? 0u : 1u;  /* USBSTS: Halted(bit0) = !RUN */
+        case 0x28:
+            return 1;           /* op page_size: 1 -> 4 KB contexts */
+        }
+        return stored;          /* DCBAA/CRCR/CONFIG/PORTSC/run/doorbells */
+    }
+    switch (off) {
+    case 0xc120:
+        return 0x5533330a;      /* GSNPSID: ip id 0x5533 (DWC3), rev 3.30A */
+    case 0xc704:
+        return stored & ~(1u << 30);   /* DCTL: CSFTRST self-clears */
+    }
+    return stored;
+}
+
+/* Power-on values for the dwc3 windows' read-only hardware config words.
+ * The xHCI side additionally needs its extended-capability chain: without
+ * at least one PROTOCOL capability (xhci-mem.c walks from HCCPARAMS.xECP)
+ * xhci-hcd fails with "No Extended Capability registers, unable to set up
+ * roothub" (-ENODEV).  We publish the classic rk3588 shape: one USB2 port
+ * + one SuperSpeed port, offsets in descending order per spec, so both
+ * root hubs get exactly one empty port (HCS1 ports == cap counts, which
+ * the classifier loop requires), and xhci_has_one_roothub() stays false.
+ */
+static const RkStubResetVal rk_dwc3_reset_vals[] = {
+    { 0x10, 0x00100000 },      /* HCCPARAMS1: xECP = 0x40/4 */
+    { 0x40, 0x02000802 },      /* PROTOCOL cap A @0x40: USB2 (major 2),
+                                 * next -> 0x60, id 2 (XHCI_EXT_CAPS_PROTOCOL) */
+    { 0x44, 4 },               /*   PSIV: high-speed */
+    { 0x48, 0x00000102 },      /*   port offset 2, count 1 */
+    { 0x60, 0x03000002 },      /* PROTOCOL cap B @0x60: SuperSpeed, end */
+    { 0x64, 3 },               /*   PSIV: SuperSpeed */
+    { 0x68, 0x00000101 },      /*   port offset 1, count 1 */
+    { 0xc140, 2 },             /* GHWPARAMS0.MODE = DRD (dual-role rk3588) */
+    { 0xc14c, 16u << 12 },     /* GHWPARAMS3: NUM_EPS=16 (bits 12-17),
+                                 * HSPHY_IFC (bits 3:2) = 0 */
+};
 
 /*
  * Main CRU window (0xfd7c0000): the Linux clk-rk3588 driver polls these
@@ -181,8 +359,77 @@ static uint32_t rk_pmu_pwr_gate_en;
  */
 static uint32_t rk_pmu_idle_req[2];
 
+
 /* PMU2_CPU_AUTO_PWR_CON has one word per core (TF-A PLATFORM_CORE_COUNT). */
 #define RK3588_PMU_NR_CPUS  8
+
+/*
+ * P20: modelled PMU core power-cycle for PSCI CPU_SUSPEND (see
+ * rk3588_pmu_cpu_resume() in rk3588.c for the hardware contract).
+ *
+ * The guest arms power-down with a hiword write of
+ *   PMU2_CPU_AUTO_PWR_CON(cpu) = 0x00030003
+ * (core_pm_en | core_pm_int_wakeup_en under mask 0x3) - TF-A's
+ * cpus_power_domain_off(cpu, core_pwr_wfi_int).  On silicon the PMU
+ * re-powers the core when an interrupt arrives.  Mark it powered off so
+ * a pending IRQ cannot resume execution after WFI, then poll for both
+ * the WFI halt and a pending physical IRQ/FIQ before warm restarting it.
+ * No synthetic wake is generated just because a core entered WFI.
+ * Cleared on machine reset (rk3588_pmu_suspend_reset):
+ * after a reset the secondaries are start-powered-off again and must not
+ * be woken without a CPU_ON.
+ */
+static QEMUTimer *rk_pmu_suspend_timer;
+static uint32_t rk_pmu_suspend_mask;              /* armed, not yet woken */
+
+#define RK3588_SUSPEND_POLL_NS   2000000   /* 2ms of guest time */
+
+static void rk_pmu_suspend_tick(void *opaque)
+{
+    int i;
+
+    for (i = 0; i < RK3588_PMU_NR_CPUS; i++) {
+        uint32_t bit = 1u << i;
+        CPUState *cs;
+
+        if (!(rk_pmu_suspend_mask & bit)) {
+            continue;
+        }
+        cs = CPU(qemu_get_cpu(i));
+        if (cs && cs->halted && rk3588_pmu_cpu_has_wakeup(i)) {
+            rk_pmu_suspend_mask &= ~bit;
+            rk3588_pmu_cpu_resume(i);
+        }
+    }
+    if (rk_pmu_suspend_mask) {
+        timer_mod(rk_pmu_suspend_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  RK3588_SUSPEND_POLL_NS);
+    }
+}
+
+static void rk_pmu_suspend_arm(int cpu)
+{
+    if (cpu < 0 || cpu >= RK3588_PMU_NR_CPUS) {
+        return;
+    }
+    if (!rk_pmu_suspend_timer) {
+        rk_pmu_suspend_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                            rk_pmu_suspend_tick, NULL);
+    }
+    rk_pmu_suspend_mask |= 1u << cpu;
+    rk3588_pmu_cpu_suspend(cpu);
+    timer_mod(rk_pmu_suspend_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + RK3588_SUSPEND_POLL_NS);
+}
+
+void rk3588_pmu_suspend_reset(void)
+{
+    rk_pmu_suspend_mask = 0;
+    if (rk_pmu_suspend_timer) {
+        timer_del(rk_pmu_suspend_timer);
+    }
+}
 
 static void rk_stub_pmu_write(hwaddr off, uint64_t value)
 {
@@ -209,7 +456,18 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
 
         /* Setting core_pm_sft_wakeup_en (bit 3) requests the wake. */
         if ((data & wen & (1u << 3)) || (wen == 0 && (data & (1u << 3)))) {
+            rk_pmu_suspend_mask &= ~(1u << cpu);   /* CPU_ON supersedes */
             rk3588_pmu_cpu_wake(cpu);
+        } else if ((wen & 0x3) == 0x3 && (data & 0x3) == 0x3 &&
+                   !(data & (1u << 3))) {
+            /*
+             * PSCI CPU_SUSPEND power-down: core_pm_en |
+             * core_pm_int_wakeup_en (TF-A cpus_power_domain_off with
+             * core_pwr_wfi_int) - arm the modelled PMU wake.  CPU_OFF
+             * writes only core_pm_en (data 0x1) and stays off until a
+             * CPU_ON, so it deliberately does not arm.
+             */
+            rk_pmu_suspend_arm(cpu);
         }
     }
     if (off == 0x810c || off == 0x8110) {
@@ -223,7 +481,55 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
             rk_pmu_idle_req[idx] = value;    /* plain regmap write */
         }
     }
+    /*
+     * Power-control registers: pwr_offset 0x14c + per-domain p_off (only
+     * 0x0 and 0x4 in rk3588_pm_domains[]), hiword-masked.  Any such write
+     * proves rockchip-pm-domain is running (firmware writes none), which
+     * unlocks the CRU arm path; a power-off pattern (data bits set under
+     * their own write-enable) additionally arms the domains whose pwr
+     * mask it carries:
+     *   gpu     pwr BIT(0)  -> repair BIT(1)   (panthor row)
+     *   rkvdec0 pwr BIT(8)  -> repair BIT(7), rkvdec1 BIT(9) -> BIT(8),
+     *   vdpu    pwr BIT(10) -> repair BIT(9).
+     * Probe writes the npu/gpu/vcodec masks; for gpu that is intentional
+     * and safe: gpu is a leaf domain (no nested power-domain child in the
+     * board DT), so arming it before pm_genpd_init only yields start_off
+     * with no add_subdomain edge to reject - and panthor's
+     * pm_runtime_resume_and_get then fails -ETIMEDOUT, aborting probe
+     * before any firmware request.  The media masks (8/9/10) are only
+     * written after probe (e.g. genpd "Disabling unused"), never during
+     * pm-genpd construction, so they cannot repeat the B3 panic.
+     */
+    if (off >= 0x814c && off < 0x81a0 && ((off - 0x814c) & 3) == 0) {
+        uint32_t data = value & 0xffff;
+        uint32_t wen = (value >> 16) & 0xffff;
+
+        rk_pd_pwr_seen = true;
+        if (off == 0x814c && data && (data & wen)) {
+            if (data & 0x001) {
+                rk_pd_media_armed |= 1u << 1;   /* gpu (panthor row) */
+            }
+            if (data & 0x100) {
+                rk_pd_media_armed |= 1u << 7;   /* rkvdec0 */
+            }
+            if (data & 0x200) {
+                rk_pd_media_armed |= 1u << 8;   /* rkvdec1 */
+            }
+            if (data & 0x400) {
+                rk_pd_media_armed |= 1u << 9;   /* vdpu */
+            }
+            if (data & 0x1000) {
+                rk_pd_media_armed |= 1u << 11;  /* av1 (hantro av1 dec) */
+            }
+        }
+    }
 }
+
+/* +0x8290 repair-status bits of the media power domains we can hold off
+ * (rk3588_pm_domains[]: vdpu BIT(9), rkvdec0 BIT(7), rkvdec1 BIT(8)).
+ * The live subset is rk_pd_media_armed - the macro keeps the mapping in
+ * one place for the write-side arming code above. */
+#define RK_PD_MEDIA_OFF_MASK  ((1u << 9) | (1u << 7) | (1u << 8))
 
 static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
 {
@@ -275,12 +581,37 @@ static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
      * probe fails.  Deferred until a fix that keeps need_regulator
      * domains "on" from genpd's perspective (e.g. skip pwr tracking
      * for the probe-time write, or fix the genpd interaction).
+     *
+     * P19 media rejection (user decision "reject with pd"): the media IPs
+     * hang off three domains whose is_on() consults +0x8290
+     * (repair_status, 1'b1 = on):
+     *   vdpu     (21) r_status = BIT(9)  - rga + vpu121 + vepu121 x4
+     *   rkvdec0  (14) r_status = BIT(7)  - video-codec@fdc38000
+     *   rkvdec1  (15) r_status = BIT(8)  - video-codec@fdc40000
+     * The domains are held off only once rk_pd_media_armed says so (armed
+     * AFTER pm-genpd construction - see the state comment, arming during
+     * probe panics genpd_debug_init).  Once armed, every power-on poll
+     * fails after 10 ms ("failed to set domain '<x>' on", -ETIMEDOUT): a
+     * driver that powers on inside probe (rga does) aborts its probe
+     * instead of registering an idle /dev/video node, and codecs that
+     * power on at open() fail there instead - their drivers read no
+     * revision register, so a register-level -ENODEV trick does not
+     * exist.  Power-off short-circuits silently once armed (is_on is
+     * already false), and none of the three is a need_regulator domain,
+     * so the B3 probe-time power-off trap does not apply.  Their sibling
+     * iommu@ nodes only pm_runtime_enable() in probe, so the iommu stays
+     * available and consumers fail hard rather than defer forever.
      */
     if (off == 0x8180 || off == 0x81f8) {
         return 0;
     }
-    if (off == 0x81f0 || off == 0x8290) {
+    if (off == 0x81f0) {
         return 0xffffffffu;
+    }
+    if (off == 0x8290) {
+        /* Armed media domains read as OFF (1'b1 = on here).  See the
+         * rk_pd_media_armed state comment for the arming rules. */
+        return 0xffffffffu & ~rk_pd_media_armed;
     }
     return stored;
 }
@@ -289,6 +620,35 @@ static uint64_t rk_stub_otp_read(uint32_t stored, hwaddr off)
 {
     if (off == 0x84) {
         stored |= 1u << 1;     /* OTPC_INT_ST: RD_DONE */
+    }
+    return stored;
+}
+
+/*
+ * KEYLADDER_S (0xfe380000, 64 KB, TRM Part1 address map) - the vendor
+ * BL31 (unmodified Armbian u-boot.itb bl31, plan.md P20) fetches through
+ * it on its OTP path:
+ *   0x5bbb4: str 1 -> [0xfe380624], str 0 -> [0xfe380620],
+ *            poll [0xfe380624] bit0 until SET (else "timeout" after
+ *            10001 x udelay(1)), then str to [0xfe38060c].
+ *   0x5bc98: str -> [0xfe380450]/[0xfe380458], str 1 -> [0xfe380454],
+ *            poll [0xfe380454] bit0 until CLEAR (else the otp-read
+ *            error path).
+ * With the window unassigned the very first store takes an EL3 Data
+ * Abort (ESR 0x96000050 = EC 0x25, DFSC translation fault L0, FAR
+ * 0xfe380624, ELR 0x5bbe0) and this BL31's abort vector path ends in
+ * rockchip_soc_soft_reset(): "system reset......" + WFI park, i.e. the
+ * boot never reaches U-Boot.  Map the window plain RW and satisfy both
+ * polls: 0x624 = engine-ready (stays set once started), 0x454 = busy
+ * (self-clearing), everything else = backing store.
+ */
+static uint64_t rk_stub_keyladder_read(uint32_t stored, hwaddr off)
+{
+    switch (off) {
+    case 0x624:
+        return stored | 1u;        /* start/poll reg: ready */
+    case 0x454:
+        return stored & ~1u;       /* busy bit self-clears */
     }
     return stored;
 }
@@ -459,13 +819,20 @@ static uint64_t rk_stub_spi_read(uint32_t stored, hwaddr off)
  * poll GMAC_MAC_MDIO_ADDRESS's GB busy bit (bit0), expecting the hardware
  * to clear it when the clause-22 operation completes; backing RAM would
  * keep it set forever and burn the full 1000 x 10us timeout per access.
- * MDIO_DATA reads return the untouched backing store (zero -> unknown PHY
- * ID, which the driver treats as non-fatal).
+ *
+ * MDIO_DATA (0x204) answers 0xffff: there is no PHY on the PHYID reads,
+ * so phylib finds no device and stmmac_mdio_register()/stmmac_phy_setup()
+ * bail out with -ENODEV ("No PHY found") instead of the backing-store
+ * zero, which phylib treated as a real-but-unsupported ID and burned the
+ * MII scan (and a 1.7 s phylib delay) on before failing -EINVAL.
  */
 static uint64_t rk_stub_gmac_read(uint32_t stored, hwaddr off)
 {
     if (off == 0x200) {         /* GMAC_MAC_MDIO_ADDRESS: self-clear GB */
         stored &= ~1u;
+    }
+    if (off == 0x204) {         /* GMAC_MAC_MDIO_DATA: no PHY answers */
+        return (stored & ~0xffffu) | 0xffffu;
     }
     return stored;
 }
@@ -508,13 +875,25 @@ static uint64_t rk_stub_pcie3phy_read(uint32_t stored, hwaddr off)
  * PciSetRcMode/PciEnableLtssm write +0x0/+0x1c/+0x2c/+0x180, then
  * PciIsLinkUp polls PCIE_CLIENT_LTSSM_STATUS (+0x300) for
  * RDLH_LINK_UP|SMLH_LINK_UP and state 0x11 (10 x 100ms retries before
- * EFI_TIMEOUT).  Report link-up so segment init completes at once.
- * Region covers all five controller windows (5 x 64KB).
+ * EFI_TIMEOUT).  Region covers all five controller windows (5 x 64KB).
+ *
+ * +0x300 is the one register both worlds read for opposite reasons:
+ *   firmware (EDK2/u-boot) needs link-up so segment init completes at
+ *   once, while Linux's rockchip_pcie_link_up() wants
+ *   FIELD_GET(17:16) == 0x3 and dw_pcie_wait_for_link() then reads
+ *   bits 5:0 as the LTSSM state - 0x00 = Detect.Quiet -> "Device not
+ *   found" -> -ENODEV, i.e. the P19 decision row (no card in the slot).
+ * rk3588_pcie_link_up (machine property pcie-link, default on to keep
+ * the P10 stock-EDK2 path bit-identical; the Linux audit runs pass
+ * pcie-link=off) selects between the two.
  */
 static uint64_t rk_stub_pcie_apb_read(uint32_t stored, hwaddr off)
 {
     if ((off & 0xffff) == 0x300) {
-        return 0x30011;         /* RDLH_LINK_UP | SMLH_LINK_UP | LINK_UP */
+        if (rk3588_pcie_link_up) {
+            return 0x30011;     /* RDLH_LINK_UP | SMLH_LINK_UP | LINK_UP */
+        }
+        return 0;               /* link down, LTSSM = Detect.Quiet */
     }
     return stored;
 }
@@ -677,7 +1056,9 @@ static uint64_t rk_stub_read(void *opaque, hwaddr offset, unsigned size)
     uint32_t v = s->regs[aoff / 4];
     uint32_t mask = size >= 4 ? 0xffffffffu : ((1u << (size * 8)) - 1);
 
-    if (s->read_hook) {
+    if (s->read_hook2) {
+        v = s->read_hook2(s, v, aoff);
+    } else if (s->read_hook) {
         v = s->read_hook(v, aoff);
     }
     /*
@@ -819,6 +1200,13 @@ static const RkStubBlock rk_stub_blocks[] = {
        PCIESEL_CON, ComboPhy) + Combo PHY GRFs (ComboPhy InitComPhy) */
     MK_MASK("php-grf",    0xfd5b0000),
     MK_MASK("pcie3phy-grf", 0xfd5b8000, .read_hook = rk_stub_pcie3phy_read),
+    /* MIPI CSI DPHY GRFs (rockchip,rk3588-csidphy-grf syscons): no driver
+       in this kernel touches them (no CSI/ISP camera path is enabled),
+       but the nodes are enabled, so map them inertly - an accidental
+       syscon/regmap read must land on backing store, not on an unassigned
+       window.  The gap 0xfd5b1000-0xfd5b4000 has no DT node. */
+    MK_MASK("csidphy0-grf", 0xfd5b4000),
+    MK_MASK("csidphy1-grf", 0xfd5b5000),
     MK_MASK("pipe-phy0-grf", 0xfd5bc000),
     MK_MASK("pipe-phy1-grf", 0xfd5c0000),
     MK_MASK("hdptxphy0-grf", 0xfd5e0000,
@@ -979,6 +1367,10 @@ static const RkStubBlock rk_stub_blocks[] = {
        LTSSM_STATUS link-up poll in the read hook */
     { .name = "pcie-apb", .base = 0xfe150000, .size = 0x50000,
       .read_hook = rk_stub_pcie_apb_read },
+    /* system_sram1 (mmio-sram at 0xfd600000, ranges-traced from RAM):
+       the last unmapped enabled node of the coverage matrix; nothing in
+       this kernel has a driver for it, plain RW backing is enough. */
+    { .name = "mmio-sram", .base = 0xfd600000, .size = 0x100000 },
     /* DWC DBI: 5 x 4MB at 0xa40000000 (seg4 @0xa41000000): BARs, iATU
        view at +0x300000, link control/status, DBI2 header at +0x100000 */
     { .name = "pcie-dbi", .base = 0xa40000000, .size = 0x1400000 },
@@ -1018,8 +1410,9 @@ static const RkStubBlock rk_stub_blocks[] = {
       .read_hook = rk_stub_spi_read },
     { .name = "spi1", .base = 0xfeb10000, .size = 0x1000,
       .read_hook = rk_stub_spi_read },
-    { .name = "spi2", .base = 0xfeb20000, .size = 0x1000,
-      .read_hook = rk_stub_spi_read },
+    /* spi2 @0xfeb20000 (the PMIC bus) is a real model now: see
+       rk3588-spi.c - the rk806 probe needs working transfers, not RXFLR
+       fakery.  spi0/1/3/4 stay storage stubs (disabled in the DT). */
     { .name = "spi3", .base = 0xfeb30000, .size = 0x1000,
       .read_hook = rk_stub_spi_read },
     { .name = "spi4", .base = 0xfecb0000, .size = 0x1000,
@@ -1039,17 +1432,25 @@ static const RkStubBlock rk_stub_blocks[] = {
     /* USB: dwc3 DRD cores (UsbHcdInitDxe reads GSnpsId @0xc120; with 0
        it reports "not a DesignWare USB3 DRD Core" and skips the
        controller gracefully) + EHCI/OHCI USB2 hosts. */
-    { .name = "dwc3-0", .base = 0xfc000000, .size = 0x400000 },
+    { .name = "dwc3-0", .base = 0xfc000000, .size = 0x400000,
+      .read_hook2 = rk_stub_dwc3_read2,
+      .reset_vals = rk_dwc3_reset_vals, .n_reset_vals = 9 },
     { .name = "dwc3-1", .base = 0xfc400000, .size = 0x400000 },
-    { .name = "dwc3-2", .base = 0xfcd00000, .size = 0x400000 },
-    { .name = "ehci0", .base = 0xfc800000, .size = 0x40000 },
+    { .name = "dwc3-2", .base = 0xfcd00000, .size = 0x400000,
+      .read_hook2 = rk_stub_dwc3_read2,
+      .reset_vals = rk_dwc3_reset_vals, .n_reset_vals = 9 },
+    { .name = "ehci0", .base = 0xfc800000, .size = 0x40000,
+      .read_hook2 = rk_stub_ehci_read2 },
     /* ohci0 (0xfc840000) stub REMOVED: the tiny-core-linux input work
      * instantiates QEMU's real sysbus OHCI there (stubs map after
      * devices and shadow them — P11 lesson).  Consumers that merely
      * read the window now see real OHCI registers instead of storage,
      * so no invalid-access regressions. */
-    { .name = "ehci1", .base = 0xfc880000, .size = 0x40000 },
-    { .name = "ohci1", .base = 0xfc8c0000, .size = 0x40000 },
+    { .name = "ehci1", .base = 0xfc880000, .size = 0x40000,
+      .read_hook2 = rk_stub_ehci_read2 },
+    /* ohci1 (0xfc8c0000) stub REMOVED for the same reason: rk3588-
+       create_usb() now instantiates a second sysbus OHCI there (empty
+       root hub, SPI 219 = the DT interrupt of usb@fc8c0000). */
     /* VOP2 (vop@fdd90000): real model, rk3588-vop2.c; gamma-LUT
        window (reg "gamma-lut" 0xfdd95000/0x1000) is plain storage —
        written only when userspace installs a LUT. */
@@ -1073,6 +1474,10 @@ static const RkStubBlock rk_stub_blocks[] = {
     /* Secure OTP (OTP_S): the SPL reads fuse words here (same protocol) */
     { .name = "secure-otp", .base = 0xfe3a0000, .size = 0x10000,
       .read_hook = rk_stub_otp_read },
+    /* KEYLADDER_S: see rk_stub_keyladder_read() - unassigned window made
+       the vendor BL31 take an EL3 data abort and soft-reset the SoC */
+    { .name = "keyladder", .base = 0xfe380000, .size = 0x10000,
+      .read_hook = rk_stub_keyladder_read },
     { .name = "trng", .base = 0xfe378000, .size = 0x200,
       .read_hook = rk_stub_rng_read },
     /*
@@ -1118,7 +1523,7 @@ static const RkStubBlock rk_stub_blocks[] = {
      * not probe during the initramfs boot).
      */
     { .name = "smmu-v3", .base = 0xfc900000, .size = 0x2000 },
-    { .name = "gpu", .base = 0xfb000000, .size = 0x2000 },
+    { .name = "gpu", .base = 0xfb000000, .size = 0x200000 },
     /*
      * NPU / video-codec / rkvdec: the rockchip IOMMU behavioral model
      * (rk3588-iommu.c, B2) is mapped at the iommu@ bases with overlap
@@ -1169,6 +1574,7 @@ void rk3588_create_stub_regions(MemoryRegion *sysmem)
         s->plain_hi = b->plain_hi;
         s->track_engine = b->track_engine;
         s->read_hook = b->read_hook;
+        s->read_hook2 = b->read_hook2;
         s->write_hook = b->write_hook;
         if (b->track_engine) {
             s->tally = g_new0(uint8_t, b->size / 0x10000 + 1);

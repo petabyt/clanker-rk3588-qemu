@@ -1,5 +1,6 @@
 /*
- * VOP2 scanout -> ramfb-style display surface (plan.md P9).
+ * VOP2 scanout -> ramfb-style display surface (plan.md P9), plus the
+ * console-order policy (2026-10-21):
  *
  * The firmware (rk/src/rk3588/vop2.c config_smart_layer()) programs the
  * ESmart2 layer at VOP2 base + 0x1c00: master enable in region0_mst_ctl,
@@ -7,13 +8,43 @@
  * region0_vir, geometry in region0_act_info.  This module watches those
  * registers on each gfx_update and maps the guest framebuffer into a
  * DisplaySurface exactly like hw/display/ramfb.c does, so the window
- * (and monitor screendumps) show guest RAM directly.
+ * (and monitor screendumps) show guest RAM directly.  Linux fbcon uses
+ * the Cluster0 window regs instead - see rk_display_get_window().
+ *
+ * Console order (why this is a device): the window/VNC default view is
+ * always *console 0* = the first console created, and GTK pages follow
+ * creation order.  CLI -device realize (vl.c) happens after machine
+ * init, so a console created eagerly at machine init would shadow the
+ * virtio-gpu head forever.  Therefore this display is a tiny machine-
+ * internal sysbus device ("rk3588-display", id "hdmi") that registers
+ * its console from qemu_add_machine_init_done_notifier() ->
+ * qdev_machine_creation_done() runs at vl.c *after* -device realize:
+ *
+ *   vgpu=on :  console 0 = virtio-gpu head (window/VNC default = vgpu),
+ *              console 1 = VOP2/HDMI, addressable as
+ *              `screendump <file> hdmi` (qdev_find_recursive matches
+ *              the device id - same trick hw/arm/npcm8xx.c uses).
+ *   vgpu off:  HDMI is the only console, i.e. index 0 - the plain
+ *              `screendump` used by p9/p17 exits keeps working.
+ *
+ * What each console shows: QEMU seeds every new graphic console with a
+ * "Guest has not initialized the display (yet)." placeholder, so until
+ * something programs VOP2 you see that message - not garbage.  After a
+ * guest DRM modeset the surface maps the guest framebuffer verbatim;
+ * uninitialised RAM therefore *looks* like garbage until fbcon
+ * actually draws (correct emulation, not a model bug).
  */
 #include "qemu/osdep.h"
 #include "hw/core/boards.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/qdev.h"
+#include "qom/object.h"
+#include "qemu/notify.h"
+#include "system/system.h"
 #include "ui/console.h"
 #include "ui/surface.h"
 #include "system/physmem.h"
+#include "qapi/error.h"
 #include "rk3588-display.h"
 
 #define VOP2_BASE                   0xfdd90000ull
@@ -40,13 +71,17 @@
 #define CLUSTER0_ACT_INFO           0x20
 #define CLUSTER0_CLUSTER_CTRL       0x100
 
-typedef struct RkDisplay {
+OBJECT_DECLARE_SIMPLE_TYPE(RkDisplay, RK3588_DISPLAY)
+
+struct RkDisplay {
+    SysBusDevice parent_obj;
+    Notifier done;              /* machine-init-done -> create console */
     QemuConsole *con;
     bool surface_ready;
     hwaddr fb_addr;
     uint64_t fb_stride;
     uint32_t width, height;
-} RkDisplay;
+};
 
 static void rk_display_unmap(pixman_image_t *image, void *unused)
 {
@@ -95,6 +130,9 @@ static bool rk_display_gfx_update(void *opaque)
     DisplaySurface *ds;
     void *data;
 
+    if (!s->con) {
+        return true;            /* console not created yet (pre-notifier) */
+    }
     if (!rk_display_get_window(&ctl, &addr, &vir, &act)) {
         return true;
     }
@@ -156,18 +194,65 @@ static const GraphicHwOps rk_display_ops = {
 
 static RkDisplay *rk_display_state;
 
+/*
+ * Machine-init-done: runs at qdev_machine_creation_done() (vl.c), i.e.
+ * AFTER -device realize, so a virtio-gpu head realized from the
+ * command line already owns console 0 and this one is next - see the
+ * header comment for the full ordering rationale.
+ */
+static void rk_display_console_add(Notifier *notifier, void *unused)
+{
+    RkDisplay *s = container_of(notifier, RkDisplay, done);
+
+    s->con = qemu_graphic_console_create(DEVICE(s), 0, &rk_display_ops, s);
+}
+
 void rk3588_display_repaint(void)
 {
-    if (rk_display_state) {
+    if (rk_display_state && rk_display_state->con) {
         rk_display_gfx_update(rk_display_state);
     }
 }
 
+static void rk3588_display_realize(DeviceState *dev, Error **errp)
+{
+    RkDisplay *s = RK3588_DISPLAY(dev);
+
+    s->done.notify = rk_display_console_add;
+    qemu_add_machine_init_done_notifier(&s->done);
+}
+
+static void rk3588_display_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    dc->realize = rk3588_display_realize;
+    dc->desc = "RK3588 VOP2 -> graphic console (machine internal)";
+    dc->user_creatable = false;
+}
+
+static const TypeInfo rk3588_display_types[] = {
+    {
+        .name = TYPE_RK3588_DISPLAY,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(RkDisplay),
+        .class_init = rk3588_display_class_init,
+    },
+};
+
+DEFINE_TYPES(rk3588_display_types)
+
 void rk3588_display_init(MachineState *ms)
 {
-    RkDisplay *s = g_new0(RkDisplay, 1);
+    DeviceState *dev = qdev_new(TYPE_RK3588_DISPLAY);
 
     (void)ms;
-    s->con = qemu_graphic_console_create(NULL, 0, &rk_display_ops, s);
-    rk_display_state = s;
+    /*
+     * The id is what `screendump <file> hdmi` resolves the console by
+     * (qdev_find_recursive walks the default sysbus); assign it before
+     * realize, the way hw/arm/npcm8xx.c and hw/arm/virt.c do.
+     */
+    DEVICE(dev)->id = g_strdup("hdmi");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    rk_display_state = RK3588_DISPLAY(dev);
 }

@@ -3,11 +3,18 @@
 
 #include "hw/core/boards.h"
 
+#define TYPE_RK3588_DISPLAY "rk3588-display"
+
 /*
  * VOP2 -> ramfb-style display: binds a guest-RAM display surface to a
- * graphic console once the firmware programs the ESmart2 scanout layer
- * (P9).  Refresh happens on demand via the GraphicHwOps.gfx_update
- * callback, which QEMU invokes before every UI redraw and screendump.
+ * graphic console once the firmware (or a guest driver) programs a
+ * VOP2 scanout layer (P9).  The console is a machine-internal sysbus
+ * device with id "hdmi" (screendump target name); it is created from
+ * the machine-init-done notifier so a command-line virtio-gpu head
+ * keeps console 0 (the window/VNC default view) - see the .c file's
+ * header comment for the ordering rationale.  Refresh happens on
+ * demand via GraphicHwOps.gfx_update, which QEMU invokes before every
+ * UI redraw and inside screendump's qemu_console_co_wait_update.
  */
 void rk3588_display_init(MachineState *ms);
 

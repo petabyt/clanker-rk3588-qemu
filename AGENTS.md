@@ -110,6 +110,7 @@ it is far easier to grep and read a few hundred lines than to page through PDFs.
    (boot demo -> self-exit rc=0).  The recipe wipes build/AppDir first —
    linuxdeploy does NOT re-deploy usr/bin/qemu-system-aarch64 when the file
    already exists, so without the wipe the image ships a stale binary.
+9. Do not edit README.md. Only Daniel can edit it.
 
 ## Debug toolkit
 - Hang in a poll loop: -d exec (tail it), or gdbstub -s -S + aarch64-linux-gnu-gdb.
@@ -117,11 +118,39 @@ it is far easier to grep and read a few hundred lines than to page through PDFs.
 - Timer note: guest derives µs from CNTFRQ_EL0 — machine must set 24 MHz.
 - CPU: TCG only (no /dev/kvm); 8x cortex-a76, has_el3, reset EL3 pc=0.
 
-## Current milestone status: P0+P1+P2+P3+P4+P7+P8+P9 DONE (2026-10-08); P10 in progress.
+## Current milestone status: P0+P1+P2+P3+P4+P7+P8+P9+P19 DONE (P19 2026-10-21); P10 in progress.
 Scope rule #7 applies: P5 (Linux) and P6 (display) only on explicit user request.
 P10 (unmodified image boot) is the active project; see plan.md for its phases.
 P10 Step 0 (decode) DONE. Phase 1 controller DONE; its exit was revised (stock SPL
 runs in Phase 2, not Phase 1). AppImage rebuilt and smoke-tested 2026-10-08.
+P19 (2026-10-21) DONE with two documented deferrals — the device-coverage pass: a DTB
+carrying every node of the Armbian vendor DT, each backed by a model or a stub that
+makes the driver bind harmlessly or fail fast (scripts/mk-all-dtb.py ->
+images/armbian/rk3588s-orangepi-5-all.dtb; audit = scripts/run-coverage.py, matrix =
+scripts/dtb-coverage.py). Final audit: 145 enabled MMIO nodes = 34 model + 111 stub +
+0 UNMAPPED, 61 bound, devices_deferred empty, 0 probe failures, qemu -d log clean.
+Delivered this round: src/rk3588-spi.c (rockchip-spi PIO+IRQ + rk806 PMIC slave —
+clears the 7-device PMIC deferral: SD/saradc/cpufreq/panthor suppliers all register);
+an ARMED power-domain reject (media/GPU domains: probe-time genpd construction must
+see them on or pm-genpd_add_subdomain -EINVAL rolls rockchip-pm-domain back and
+genpd_debug_init oopses PID1 — arming rules in rk3588-stubs.c); EHCI + dwc3/xHCI
+window models and a 2nd sysbus-ohci (all five USB hosts bind with empty root hubs;
+"0 ports" is impossible — usbcore rejects it — so each hub gets one dead port); the
+machine `pcie-link` property (default on keeps P10/EDK2 bit-identical, Linux audits
+pass `-M rk3588,pcie-link=off` = the empty slot, giving "Phy link never came up");
+gmac MDIO answers no-PHY (-ENODEV, no MII scan); virtio transports moved to SPI
+476-479 (92-94 collide with gpu@fb000000 job/mmu/gpu); virtio SHM_SEL accepted;
+gpu stub widened to 2 MB; sram@fd600000 spanned. qemu.patch now covers 11 files
+(adds hw/virtio/virtio-mmio.c, hw/usb/hcd-ohci.c, ui/console.c — the last two
+had been silently dropped by a partial regen; status == patch list verified). Gates: run-coverage rc=0, make appimage + AppImage demo
+self-exit rc=0, ./p9-exit.sh rc=0, ./p17-exit.sh rc=0, desktop verified through
+plasmashell + kwin_wayland on the AppImage (serial never prints plasmashell — check
+with a typed `ps aux`), make all-dtb green. Deferred by user decision ("defer
+media/gpu"): rga/hantro/vdec/av1/panthor bind-but-dead (armed domains fail every
+power-on -ETIMEDOUT at first use, no firmware requested). Non-blocking leftovers:
+typec fusb302 tcpm, sound (es8328/asoc parse errors), cpufreq-dt defer, vdec probe
+corner, pm-domain B3-family + armed-domain mem-status log noise. Full record: plan.md
+"P19".
 Scratch SD images: copy the stock image to /tmp and pad to 16 MiB; never -drive the
 stock file directly (EDK2 writes to the card).
 Shutdown (2026-10-08, post-milestone): PSCI_SYSTEM_OFF (demo fw_handler / U-Boot
@@ -134,7 +163,10 @@ follow-up").  Firmware DTB also carries a /psci node; U-Boot uses its own linked
 DTB as control FDT (fdtdec_setup ignores the x0 DTB), which already had
 arm,psci-1.0/method=smc from rk3588-base.dtsi.
 P9 (2026-10-08): VOP2 -> ramfb display (src/rk3588-display.c, +meson.build,
-qemu.patch regenerated).  One graphic console created at machine init; its
+qemu.patch regenerated).  One graphic console — since 2026-10-21 created at
+machine-init-done as the named device "hdmi" (qdev id = its `screendump`
+target) so that a CLI `-device virtio-gpu-device` owns console 0, the
+window/VNC default view; its
 GraphicHwOps.gfx_update reads the firmware's ESmart2 scanout regs
 (0xfdd91c00: mst_ctl/yrgb/vir/act_info — rk/src/rk3588/vop2.c
 config_smart_layer) and maps guest RAM at fb=0xd0000000 (1920x1080 XRGB8888)
@@ -194,3 +226,25 @@ mask bits 31:16 gate data bits 15:0, high half never reads back) and plain RW
 bit15=1, PMU version=0x3588, eDP DET_STA/HPD/PLL-lock. Region quirks learned: EDP-TX
 PHY is 0x2000 (u-boot binding), power-gate status reads 0 => "already on" fast path.
 Exits pasted in plan.md.
+
+P20 (2026-10-26) DONE: the unmodified in-repo Armbian 26.8.1 OPi5 image
+boots from SD unit 0 through its own DDR/SPL/TF-A/U-Boot/boot.scr/kernel/
+initramfs/DTB to `orangepi5 login: root (automatic login)`.  Exit:
+`./p20-exit.sh` rc=0, login at 362 s, Linux online mask 0xff, zero serial
+stdin, base SHA256 and logical first 16 MiB unchanged, QEMU diagnostic log
+0 bytes.  `make run-opi5-raw` runs the same fresh-overlay login harness;
+`make test-boot-devices` regresses asynchronous Rockchip broadcast timer
+expiry and DW-MSHC engine reset/IRQ behavior.  Read-only eight-CPU proof:
+scripts/check-opi5-cpus.gdb, offsets from the SHA256-pinned image's own
+System.map, not local Linux 7.2.9.  P9/P17 and the actual host-staged
+scripts/run-desktop.py flow passed; final AppImage rebuilt and demo
+self-exited rc=0.  This is disk-to-serial-login, not native GPU/KDE support;
+existing media/GPU deferrals and guest power-domain/service warnings remain.
+PMU suspend now gates power at EL3 WFI and restarts on redistributor pending
+interrupt state (not masked CPU IRQ output), sampled every 2 ms.  The new
+local CPU hook lives in target/arm/cpu.h and target/arm/tcg/op_helper.c.
+qemu.patch now covers 13 files: when regenerating, include those two plus
+ALL existing modified files (`git -C qemu diff --name-only`); never use the
+older partial file lists above.  Full evidence and limitations: plan.md P20.
+Never pass the pristine image directly to scripts/run-desktop.py: that
+separate regression runner writes its raw unit-1 disk; use a scratch raw copy.

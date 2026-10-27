@@ -19,14 +19,14 @@ index 4445f16..317c847 100644
      bool
      default y
 diff --git a/hw/arm/meson.build b/hw/arm/meson.build
-index bcc068d..0876d84 100644
+index bcc068d..32cd585 100644
 --- a/hw/arm/meson.build
 +++ b/hw/arm/meson.build
 @@ -12,6 +12,7 @@ arm_common_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx.c', 'npcm7xx_b
  arm_common_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm8xx.c', 'npcm8xx_boards.c'))
  arm_common_ss.add(when: 'CONFIG_REALVIEW', if_true: files('realview.c'))
  arm_common_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa-ref.c'))
-+arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c', 'rk3588/rk3588-i2c.c', 'rk3588/rk3588-i2chid.c'))
++arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c', 'rk3588/rk3588-i2c.c', 'rk3588/rk3588-i2chid.c', 'rk3588/rk3588-spi.c'))
  arm_common_ss.add(when: 'CONFIG_STELLARIS', if_true: files('stellaris.c'))
  arm_common_ss.add(when: 'CONFIG_STM32VLDISCOVERY', if_true: files('stm32vldiscovery.c'))
  arm_common_ss.add(when: 'CONFIG_ZYNQ', if_true: files('xilinx_zynq.c'))
@@ -207,8 +207,41 @@ index 5e5fe41..2c0897f 100644
          }
          break;
  
+diff --git a/hw/virtio/virtio-mmio.c b/hw/virtio/virtio-mmio.c
+index 55ceaee..d93ccac 100644
+--- a/hw/virtio/virtio-mmio.c
++++ b/hw/virtio/virtio-mmio.c
+@@ -513,6 +513,15 @@ static void virtio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
+                       "%s: write to read-only register (0x%" HWADDR_PRIx ")\n",
+                       __func__, offset);
+         break;
++    case VIRTIO_MMIO_SHM_SEL:
++        /*
++         * Spec-defined register: the guest writes the SHM index before
++         * reading SHM_LEN_*, which already answers -1 ("no such region")
++         * because no VIRTIO_F_*_SHM feature is advertised - so the guest
++         * stops after index 0.  Accept the select write instead of
++         * logging a guest error for it.
++         */
++        break;
+ 
+     default:
+         qemu_log_mask(LOG_GUEST_ERROR,
+diff --git a/target/arm/cpu.h b/target/arm/cpu.h
+index 06ebed4..466a400 100644
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -762,6 +762,8 @@ typedef struct CPUArchState {
+ 
+     /* Reason the CPU is halted */
+     ARMHaltReason halt_reason;
++    /* Board PMU request: the next EL3 WFI gates power until board wake. */
++    bool power_down_on_wfi;
+ 
+     /*
+      * The event register is shared by all ARM profiles (A/R/M),
 diff --git a/target/arm/helper.c b/target/arm/helper.c
-index ff0b766..149ed76 100644
+index ff0b766..fc3499f 100644
 --- a/target/arm/helper.c
 +++ b/target/arm/helper.c
 @@ -25,6 +25,7 @@
@@ -261,3 +294,78 @@ index ff0b766..149ed76 100644
              { .name = "SCTLR_EL3", .state = ARM_CP_STATE_AA64,
                .opc0 = 3, .opc1 = 6, .crn = 1, .crm = 0, .opc2 = 0,
                .access = PL3_RW, .fgt = FGT_SCTLR_EL3,
+@@ -7242,6 +7263,41 @@ void register_cp_regs_for_features(ARMCPU *cpu)
+ 
+         define_arm_cp_regs(cpu, el3_regs);
+     }
++
++    /*
++     * IMPLEMENTATION DEFINED / debug registers that the vendor TF-A in the
++     * unmodified Armbian u-boot.itb touches from EL3 (plan.md P20):
++     *  - CPUECTLR_EL1 (S3_0_C15_C1_4): erratum workarounds and
++     *    cortex_a76_cpu_reg_dump().
++     *  - CPUPWRCTLR_EL1 (S3_0_C15_C2_7): cortex_a76_core_pwr_dwn() does an
++     *    RMW on every PSCI CPU_SUSPEND, i.e. on every cpuidle entry of a
++     *    guest DTB that carries cpu-idle-states (P13b's warm-reset bug).
++     *  - DBGPRCR_EL1 (S2_0_C1_C4_4): rockchip_soc_cores_pwr_dm_suspend()
++     *    clears CORENPDRQ before parking the core.  Without it the UNDEF
++     *    lands in the EL3 abort vector, whose path ends in
++     *    rockchip_soc_soft_reset() - observed as "system reset......" plus
++     *    a WFI park while the other cores deadlocked on a BL31 lock.
++     * All three are RAZ/WI: reads 0, writes ignored - a modelled
++     * implementation has no core power-down latch or debug power control
++     * to honour, and the errata bits are TCG nops.
++     */
++    if (arm_feature(env, ARM_FEATURE_AARCH64)) {
++        static const ARMCPRegInfo a76_impdef_cp_reginfo[] = {
++            { .name = "CPUECTLR_EL1", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 1, .opc2 = 4,
++              .access = PL1_RW, .type = ARM_CP_CONST | ARM_CP_NO_RAW,
++              .resetvalue = 0 },
++            { .name = "CPUPWRCTLR_EL1", .state = ARM_CP_STATE_AA64,
++              .opc0 = 3, .opc1 = 0, .crn = 15, .crm = 2, .opc2 = 7,
++              .access = PL1_RW, .type = ARM_CP_CONST | ARM_CP_NO_RAW,
++              .resetvalue = 0 },
++            { .name = "DBGPRCR_EL1", .state = ARM_CP_STATE_AA64,
++              .opc0 = 2, .opc1 = 0, .crn = 1, .crm = 4, .opc2 = 4,
++              .access = PL1_RW, .type = ARM_CP_CONST | ARM_CP_NO_RAW,
++              .resetvalue = 0 },
++        };
++        define_arm_cp_regs(cpu, a76_impdef_cp_reginfo);
++    }
+     /*
+      * The behaviour of NSACR is sufficiently various that we don't
+      * try to describe it in a single reginfo:
+diff --git a/target/arm/tcg/op_helper.c b/target/arm/tcg/op_helper.c
+index af56eff..8d44c80 100644
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -380,6 +380,14 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
+     uint32_t excp;
+     int target_el = check_wfx_trap(env, false, &excp);
+ 
++    if (env->power_down_on_wfi && arm_current_el(env) == 3) {
++        env->power_down_on_wfi = false;
++        arm_set_cpu_power_state(env_archcpu(env), PSCI_OFF);
++        cs->exception_index = EXCP_HLT;
++        cs->halted = 1;
++        cpu_loop_exit(cs);
++    }
++
+     if (cpu_has_work(cs)) {
+         /* Don't bother to go into our "low power state" if
+          * we would just wake up immediately.
+diff --git a/ui/console.c b/ui/console.c
+index 14f1481..7345beb 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1220,6 +1220,9 @@ QemuConsole *qemu_console_lookup_by_device(DeviceState *dev, uint32_t head)
+     uint32_t h;
+ 
+     QTAILQ_FOREACH(con, &consoles, next) {
++        if (!QEMU_IS_GRAPHIC_CONSOLE(con)) {
++            continue;
++        }
+         obj = object_property_get_link(OBJECT(con),
+                                        "device", &error_abort);
+         if (DEVICE(obj) != dev) {

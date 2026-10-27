@@ -39,3 +39,13 @@ logs.txt
 /board-runs/
 Armbian*
 opi5-16gb-boot.txt
+
+# Local-only integration assets
+/FHS.md
+/fhs-os-*.img
+/scripts/*fhs*.py
+/tiny-core-linux/
+
+# Run logs and Python bytecode
+/qemu-p*.log
+*.pyc

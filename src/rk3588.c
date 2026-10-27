@@ -37,6 +37,7 @@
 #include "target/arm/gtimer.h"
 #include "target/arm/internals.h"
 #include "dw-apb-uart.h"
+#include "rk3588-spi.h"
 #include "rk3588-dwmshc.h"
 #include "rk3588-timer.h"
 #include "rk3588-stubs.h"
@@ -159,9 +160,17 @@ static uint64_t rk3588_bl33_base = RK3588_BL33_BASE;
 /* SD-card boot: the FIT's edk2 node loads at 0x200000 (see plan.md P10). */
 #define RK3588_SD_BL33_BASE      0x00200000ULL
 static bool rk3588_bl33_explicit;
-/* Optional virtio-gpu transport at the Mali slot, -machine vgpu=on; the
- * guest DTB must pair it with a virtio,mmio node replacing gpu@fb000000. */
+/* Optional virtio transports at 0xfb200000 (just past the Mali window), -machine
+ * vgpu=on; the guest DTB carries one virtio,mmio node per transport next to the
+ * real gpu@fb000000 node (see scripts/mk-all-dtb.py). */
 static bool rk3588_vgpu;
+/* PCIe link state served by the APB-client LTSSM_STATUS stub (+0x300).
+ * Default on: the P10 stock-EDK2 path polls it for link-up during segment
+ * init and must keep its exact prior behaviour.  The Linux audit runs pass
+ * -M rk3588,pcie-link=off to model the empty slot the VM really has, which
+ * makes dw_pcie_wait_for_link() see Detect.Quiet -> "Device not found" ->
+ * -ENODEV instead of an invented Gen.0 x0 link.  Read by rk3588-stubs.c. */
+bool rk3588_pcie_link_up = true;
 
 struct RkParamHeader {
     uint8_t type;
@@ -637,6 +646,24 @@ static void rk3588_atf_reset(void *opaque)
  * safe to call from any vCPU's MMIO context under MTTCG.
  */
 static bool rk3588_cpu_woken[RK3588_NR_CPUS];
+static GICv3State *rk3588_gic;
+
+bool rk3588_pmu_cpu_has_wakeup(int cpu_index)
+{
+    GICv3CPUState *r;
+
+    if (!rk3588_gic || cpu_index < 0 || cpu_index >= RK3588_NR_CPUS) {
+        return false;
+    }
+    r = &rk3588_gic->cpu[cpu_index];
+    /*
+     * TF-A disables the CPU interface before powerdown.  The PMU's wake
+     * input is redistributor pending state, not the masked CPU IRQ pin.
+     */
+    return r->hppi.prio != 0xff ||
+           ((r->gicr_ipendr0 | r->level) & r->gicr_ienabler0 &
+            ~r->gicr_iactiver0);
+}
 
 static void rk3588_pmu_cpu_wake_async(CPUState *cs, run_on_cpu_data data)
 {
@@ -664,11 +691,79 @@ void rk3588_pmu_cpu_wake(int cpu_index)
     async_run_on_cpu(cs, rk3588_pmu_cpu_wake_async, RUN_ON_CPU_NULL);
 }
 
+/*
+ * P20: modelled PMU core power-cycle for PSCI CPU_SUSPEND.
+ *
+ * The vendor BL31 (unmodified Armbian u-boot.itb) parks a core that is
+ * being suspended with `dsb; wfi` after arming PMU2_CPU_AUTO_PWR_CON =
+ * core_pm_en | core_pm_int_wakeup_en (0x00030003) - on silicon the SoC
+ * PMU then re-powers the core when the guest's programmed wake time
+ * arrives, and the core restarts in the pmusram entry (0xFF100000) where
+ * the warm-boot path restores the saved context and returns to the guest.
+ *
+ * A normal IRQ wake must not continue after WFI: that is BL31's
+ * unexpected-wake path.  rk3588_pmu_cpu_suspend() marks the core off;
+ * the PMU polls pending interrupt inputs and restarts it here instead.
+ * Linux's DT idle state stops local timers, so the wake commonly comes
+ * from an SGI sent by the Rockchip broadcast timer's interrupt handler.
+ *
+ * The PMU stub arms this on the suspend pattern write and calls back once
+ * the vCPU has actually parked and has a pending IRQ/FIQ.
+ * Unlike CPU_ON this is valid for the boot core too and may repeat every
+ * idle entry, so it deliberately bypasses rk3588_cpu_woken[].
+ */
+void rk3588_pmu_cpu_resume(int cpu_index)
+{
+    CPUState *cs;
+
+    if (cpu_index < 0 || cpu_index >= RK3588_NR_CPUS) {
+        return;
+    }
+    cs = CPU(qemu_get_cpu(cpu_index));
+    async_run_on_cpu(cs, rk3588_pmu_cpu_wake_async, RUN_ON_CPU_NULL);
+}
+
+void rk3588_pmu_cpu_suspend(int cpu_index)
+{
+    ARMCPU *cpu;
+
+    if (cpu_index < 0 || cpu_index >= RK3588_NR_CPUS) {
+        return;
+    }
+    cpu = ARM_CPU(qemu_get_cpu(cpu_index));
+    /*
+     * Let firmware reach WFI, but do not let an IRQ resume execution
+     * after that WFI.  A powered-down core restarts at the PMU vector.
+     * Pending IRQ inputs remain visible to the PMU wake detector.
+     */
+    cpu->env.power_down_on_wfi = true;
+}
+
 static void rk3588_smp_reset(void *opaque)
 {
     memset(rk3588_cpu_woken, 0, sizeof(rk3588_cpu_woken));
+    rk3588_pmu_suspend_reset();
     /* start-powered-off re-parks secondaries via cpu_reset (A3). */
 }
+
+/* GIC-600 GICR_PWRR: redistributors remain powered in this model. */
+static uint64_t rk3588_gicr_pwrr_read(void *opaque, hwaddr off, unsigned size)
+{
+    return 0;
+}
+
+static void rk3588_gicr_pwrr_write(void *opaque, hwaddr off,
+                                  uint64_t value, unsigned size)
+{
+}
+
+static const MemoryRegionOps rk3588_gicr_pwrr_ops = {
+    .read = rk3588_gicr_pwrr_read,
+    .write = rk3588_gicr_pwrr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
 
 static DeviceState *rk3588_create_gic(MachineState *ms)
 {
@@ -684,8 +779,18 @@ static DeviceState *rk3588_create_gic(MachineState *ms)
     qdev_prop_set_array(gic, "redist-region-count", redist_regions);
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(gic), &error_fatal);
+    rk3588_gic = ARM_GICV3_COMMON(gic);
     sysbus_mmio_map(SYS_BUS_DEVICE(gic), 0, RK3588_GICD_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(gic), 1, RK3588_GICR_BASE);
+    for (unsigned i = 0; i < ms->smp.cpus; i++) {
+        MemoryRegion *pwrr = g_new0(MemoryRegion, 1);
+
+        memory_region_init_io(pwrr, OBJECT(ms), &rk3588_gicr_pwrr_ops,
+                              NULL, "rk3588-gicr-pwrr", 4);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                           RK3588_GICR_BASE + i * 0x20000 + 0x24,
+                                           pwrr, 1);
+    }
     return gic;
 }
 
@@ -824,6 +929,27 @@ static void rk3588_create_i2cs(DeviceState *gic)
 }
 
 /*
+ * SPI controllers: only spi2 (0xfeb20000, GIC SPI 328 = raw DT cell 0x148,
+ * the same numbering convention as the uarts/i2cs above) is enabled in the
+ * board DT, and it carries the rk806 PMIC at cs0.  It needs the real model
+ * (rk3588-spi.c): the Linux spi-rockchip PIO path only completes inside its
+ * ISR, so a storage stub makes every transfer die with "SPI transfer timed
+ * out" and the PMIC's regulators never register - which deferred gpu
+ * (panthor), saradc, SD slot, cpufreq and adc-keys behind them.  The other
+ * four spi nodes are disabled in the DT and keep their storage stubs.
+ */
+static void rk3588_create_spis(DeviceState *gic)
+{
+    DeviceState *dev = qdev_new(TYPE_RK3588_SPI);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_bit(dev, "has-pmic", true);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, 0xfeb20000);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 328));
+}
+
+/*
  * Genbook-faithful input wiring:
  *  - touchpad: the i2c-hid slave drives GPIO1_PD6; here we hand the GIC
  *    SPI 278 line to the stub layer (rk3588_touchpad_set_line()).
@@ -839,19 +965,36 @@ static void rk3588_create_input(DeviceState *gic)
 
 static void rk3588_create_usb(DeviceState *gic)
 {
-    DeviceState *dev = qdev_new("sysbus-ohci");
-    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
-    DeviceState *kbd;
+    static const struct {
+        uint64_t base;
+        int spi;
+        bool kbd;
+    } ohcis[] = {
+        { 0xfc840000, 216, true },  /* usb_host0_ohci: real model + keyboard */
+        { 0xfc8c0000, 219, false }, /* usb_host1_ohci: empty root hub (SPI
+                                       0xdb = DT cell of usb@fc8c0000); the
+                                       ohci1 storage stub is gone so the
+                                       guest's ohci-platform binds a real
+                                       controller with no device behind it */
+    };
 
-    sysbus_realize_and_unref(sbd, &error_fatal);
-    sysbus_mmio_map(sbd, 0, 0xfc840000);
-    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 216));
+    for (int i = 0; i < ARRAY_SIZE(ohcis); i++) {
+        DeviceState *dev = qdev_new("sysbus-ohci");
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
-    kbd = qdev_new("usb-kbd");
-    /* qdev_realize takes the bus itself; set_parent_bus+realize(NULL)
-       trips the !parent_bus assertion. */
-    qdev_realize(kbd, qdev_get_child_bus(dev, "usb-bus.0"), &error_fatal);
-    object_unref(OBJECT(kbd));
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, ohcis[i].base);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, ohcis[i].spi));
+
+        if (ohcis[i].kbd) {
+            DeviceState *kbd = qdev_new("usb-kbd");
+            /* qdev_realize takes the bus itself; set_parent_bus+realize(NULL)
+               trips the !parent_bus assertion. */
+            qdev_realize(kbd, qdev_get_child_bus(dev, "usb-bus.0"),
+                         &error_fatal);
+            object_unref(OBJECT(kbd));
+        }
+    }
 }
 
 static void rk3588_create_display_devices(DeviceState *gic)
@@ -929,26 +1072,32 @@ static void rk3588_create_display_devices(DeviceState *gic)
  * real GIC SPI 289 (0x121).
  */
 /*
- * Optional virtio devices at the Mali slot (0xfb000000, GIC SPIs 92-94,
- * 98): four virtio-mmio transports, 0x1000 apart, inside the old 2 MB Mali
- * window.  Attach devices with -device, in this order:
- *   -device virtio-net-device,netdev=net0               -> 0xfb003000 (SPI 98)
- *   -device virtio-gpu-device[,id=vgpu,xres=,yres=]     -> 0xfb002000 (SPI 94)
- *   -device virtio-keyboard-device                      -> 0xfb001000 (SPI 93)
- *   -device virtio-tablet-device                        -> 0xfb000000 (SPI 92)
+ * Optional virtio devices (GIC SPIs 476-479): four virtio-mmio
+ * transports, 0x1000 apart, at 0xfb200000 - just past the 2 MB Mali
+ * window (0xfb000000..0xfb200000), which is deliberately left alone so
+ * the plain 'gpu' storage stub in rk3588-stubs.c keeps answering panthor
+ * honestly: GPU_ID (offset 0x0) reads 0 -> panthor_hw_gpu_id_init()
+ * fails with -ENXIO before it touches firmware, and the guest DTB gets to
+ * keep its real rockchip,rk3588-mali node.  Attach devices with -device,
+ * in this order:
+ *   -device virtio-net-device,netdev=net0               -> 0xfb203000 (SPI 479)
+ *   -device virtio-gpu-device[,id=vgpu,xres=,yres=]     -> 0xfb202000 (SPI 478)
+ *   -device virtio-keyboard-device                      -> 0xfb201000 (SPI 477)
+ *   -device virtio-tablet-device                        -> 0xfb200000 (SPI 476)
  * (qbus_realize() prepends child buses, so qbus_find_recursive() hands
  * the first -device the last-created transport - same mechanism and
  * ordering quirk as arm virt's create_virtio_devices()).  The guest DTB
  * must carry a virtio,mmio node per transport; the guest identifies the
- * device type from the transport itself.  Mapped with overlap priority
- * 1 so they win over the plain 'gpu' storage stub in rk3588-stubs.c.
+ * device type from the transport itself.  The window 0xfb200000-
+ * 0xfc000000 is otherwise unmapped (RAM below devices ends at 0xf0000000,
+ * the ddr-probe stub ends at 0xfb000000, usb@fc000000 starts next).
  * SPI 95 (0x5f) is taken by video-codec@fdc38000 in the stock DTB, so
  * the net transport uses SPI 98 (0x62).
  */
 static void rk3588_create_virtio_gpu(DeviceState *gic)
 {
     /* SPI numbers for the four transports, lowest-to-highest address */
-    static const int spi[4] = { 92, 93, 94, 98 };
+    static const int spi[4] = { 476, 477, 478, 479 };
 
     for (int i = 0; i < 4; i++) {
         DeviceState *transport = qdev_new("virtio-mmio");
@@ -957,7 +1106,7 @@ static void rk3588_create_virtio_gpu(DeviceState *gic)
         qdev_prop_set_bit(transport, "force-legacy", false);
         sysbus_realize_and_unref(sbd, &error_fatal);
         memory_region_add_subregion_overlap(get_system_memory(),
-                                            0xfb000000 + i * 0x1000,
+                                            0xfb200000 + i * 0x1000,
                                             sysbus_mmio_get_region(sbd, 0), 1);
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, spi[i]));
     }
@@ -1016,7 +1165,7 @@ static void rk3588_create_dmacs(DeviceState *gic)
  * SD slot (sdmmc@fe2c0000).  -drive if=sd,file=...[,readonly=on] attaches an
  * SD card; without it the slot is empty and PA4 reads "no card" (P7 path).
  */
-static void rk3588_create_sdmmc(void)
+static void rk3588_create_sdmmc(DeviceState *gic)
 {
     DeviceState *dev = qdev_new(TYPE_RK3588_DWMSHC);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
@@ -1025,6 +1174,9 @@ static void rk3588_create_sdmmc(void)
 
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, RK3588_SDMMC_BASE);
+    /* DT: mmc@fe2c0000 interrupts = <0 203 4 0> (SPI 203, LEVEL_HIGH).
+     * Linux's dw_mmc needs this line (plan.md P20); U-Boot polled. */
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 203));
 
     if (blk) {
         DeviceState *card = qdev_new(TYPE_SD_CARD);
@@ -1189,12 +1341,13 @@ static void rk3588_init(MachineState *ms)
     rk3588_connect_gic(ms, gic);
     rk3588_create_uarts(gic);
     rk3588_create_i2cs(gic);
+    rk3588_create_spis(gic);
     rk3588_create_input(gic);
     rk3588_create_usb(gic);
     rk3588_create_display_devices(gic);
     rk3588_create_timer(gic);
     rk3588_create_dmacs(gic);
-    rk3588_create_sdmmc();
+    rk3588_create_sdmmc(gic);
     rk3588_create_emmc(gic);
     if (rk3588_vgpu) {
         rk3588_create_virtio_gpu(gic);
@@ -1303,6 +1456,20 @@ static void rk3588_set_vgpu(Object *obj, Visitor *v, const char *name,
     visit_type_bool(v, name, &rk3588_vgpu, errp);
 }
 
+static void rk3588_get_pcie_link(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    bool val = rk3588_pcie_link_up;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_pcie_link(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_pcie_link_up, errp);
+}
+
 static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1318,9 +1485,18 @@ static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
                               rk3588_get_vgpu, rk3588_set_vgpu,
                               NULL, NULL);
     object_class_property_set_description(oc, "vgpu",
-                                          "Create a virtio-mmio transport at "
-                                          "the Mali slot (0xfb000000, SPI 92) "
-                                          "for -device virtio-gpu[-gl]-device");
+                                          "Create four virtio-mmio transports "
+                                          "at 0xfb200000 (SPI 92) for -device "
+                                          "virtio-gpu[-gl]-device and friends");
+    object_class_property_add(oc, "pcie-link", "boolean",
+                              rk3588_get_pcie_link, rk3588_set_pcie_link,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pcie-link",
+                                          "Report PCIe link-up in the APB "
+                                          "LTSSM_STATUS stub (default on for "
+                                          "the P10 stock-EDK2 path; pass "
+                                          "pcie-link=off to model the empty "
+                                          "slot the VM has)");
     rk3588_machine_init(mc);
 }
 
