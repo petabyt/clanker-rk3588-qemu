@@ -32,7 +32,7 @@ APPIMG_ICON   := packaging/rk3588-qemu.png
 
 .PHONY: all qemu rk appimage run-sd trace-sd regress sd-own-bl31 sd-v116 run-v116 \
 	run-linux run-linux-edp linux-initramfs linux-dtb all-dtb clean distclean help \
-	run-opi5-raw test-boot-devices
+	run-opi5-raw test-boot-devices test-pcie-config test-pcie-gpu
 
 all: qemu rk
 
@@ -45,6 +45,14 @@ run-opi5-raw: qemu
 
 test-boot-devices: qemu
 	python3 scripts/test-rk-boot-devices.py --qemu $(QEMU_BIN)
+
+test-pcie-config: qemu
+	python3 scripts/test-rk-pcie-its.py --qemu $(QEMU_BIN)
+	python3 scripts/test-rk-pcie-config.py --qemu $(QEMU_BIN)
+	python3 scripts/test-rk-pcie-reset.py --qemu $(QEMU_BIN)
+
+test-pcie-gpu: qemu
+	python3 scripts/test-rk-pcie-gpu.py --qemu $(QEMU_BIN)
 
 # The symlink must exist before meson parses hw/arm/meson.build.
 $(QEMU_SYMLINK):
@@ -65,7 +73,7 @@ $(QEMU_BUILD)/config.status: $(QEMU_DIR)/configure $(QEMU_PATCH) \
 		echo "$(QEMU_PATCH): already applied"; \
 	else \
 		echo "ERROR: $(QEMU_PATCH) is out of sync with ./qemu." >&2; \
-		echo "Regenerate it: git -C $(QEMU_DIR) diff -- hw/arm/Kconfig hw/arm/meson.build hw/arm/trace-events hw/sd/sd.c hw/sd/sdhci.c hw/sd/sdhci-internal.h hw/sd/sdmmc-internal.h target/arm/helper.c target/arm/cpu.h target/arm/tcg/op_helper.c hw/virtio/virtio-mmio.c hw/usb/hcd-ohci.c ui/console.c > $(QEMU_PATCH)" >&2; \
+		echo "Regenerate it: git -C $(QEMU_DIR) diff > $(QEMU_PATCH) (check git -C $(QEMU_DIR) diff --name-only first)" >&2; \
 		exit 1; \
 	fi
 	@mkdir -p $(QEMU_BUILD)
@@ -347,6 +355,8 @@ help:
 	@echo "  all-dtb - P19 'all devices' Armbian boot DTB"
 	@echo "  run-opi5-raw - stock Armbian disk autoboot and serial-login gate"
 	@echo "  test-boot-devices - broadcast timer and SD reset regressions"
+	@echo "  test-pcie-config - experimental PCIe configuration and ITS tests"
+	@echo "  test-pcie-gpu - stock Armbian PCIe GPU DMA, MSI-X and scanout test"
 	@echo "  clean   - remove $(BUILD_DIR)/ + $(APPIMAGE)"
 	@echo "  distclean - clean + rk clean"
 

@@ -1,8 +1,8 @@
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index 4445f16..317c847 100644
+index 4445f16..b39428b 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -155,6 +155,15 @@ config REALVIEW
+@@ -155,6 +155,17 @@ config REALVIEW
      select DS1338 # I2C RTC+NVRAM
      select USB_OHCI_SYSBUS
  
@@ -14,6 +14,8 @@ index 4445f16..317c847 100644
 +    select ARM_GIC
 +    select UNIMP
 +    select PL330
++    select PCI_EXPRESS_DESIGNWARE
++    select ARM_SMMUV3
 +
  config SBSA_REF
      bool
@@ -42,6 +44,92 @@ index 1b16f71..1054c38 100644
 +# rk3588/rk3588-edp.c
 +rk3588_edp_aux(const char *bus, const char *op, uint32_t addr, uint32_t len, uint32_t status) "AUX %s %s addr=0x%03x len=%u status=%u"
 +rk3588_edp_dpcd_write(uint32_t addr, uint32_t val) "DPCD[0x%03x] <- 0x%02x"
+diff --git a/hw/pci-host/designware.c b/hw/pci-host/designware.c
+index 00c9449..6dfeedd 100644
+--- a/hw/pci-host/designware.c
++++ b/hw/pci-host/designware.c
+@@ -274,12 +274,13 @@ static void designware_pcie_update_viewport(DesignwarePCIERoot *root,
+ {
+     const uint64_t target = viewport->target;
+     const uint64_t base   = viewport->base;
+-    const uint64_t size   = (uint64_t)viewport->limit - base + 1;
++    const uint64_t limit  = (base & 0xffffffff00000000ULL) | viewport->limit;
++    const uint64_t size   = limit - base + 1;
+     const bool enabled    = viewport->cr[1] & DESIGNWARE_PCIE_ATU_ENABLE;
+ 
+     MemoryRegion *current, *other;
+ 
+-    if (viewport->cr[0] == DESIGNWARE_PCIE_ATU_TYPE_MEM) {
++    if ((viewport->cr[0] & 0x1f) == DESIGNWARE_PCIE_ATU_TYPE_MEM) {
+         current = &viewport->mem;
+         other   = &viewport->cfg;
+         memory_region_set_alias_offset(current, target);
+@@ -466,7 +467,7 @@ static void designware_pcie_root_realize(PCIDevice *dev, Error **errp)
+         name = designware_pcie_viewport_name(direction, i, "MEM");
+         memory_region_init_alias(mem, OBJECT(root), name, destination,
+                                  dummy_offset, dummy_size);
+-        memory_region_add_subregion(source, dummy_offset, mem);
++        memory_region_add_subregion_overlap(source, dummy_offset, mem, 1);
+         memory_region_set_enabled(mem, false);
+         g_free(name);
+ 
+@@ -479,7 +480,7 @@ static void designware_pcie_root_realize(PCIDevice *dev, Error **errp)
+         memory_region_init_io(&viewport->cfg, OBJECT(root),
+                               &designware_pci_host_conf_ops,
+                               viewport, name, dummy_size);
+-        memory_region_add_subregion(source, dummy_offset, mem);
++        memory_region_add_subregion_overlap(source, dummy_offset, mem, 1);
+         memory_region_set_enabled(mem, false);
+         g_free(name);
+     }
+@@ -587,6 +588,38 @@ static const VMStateDescription vmstate_designware_pcie_root = {
+     }
+ };
+ 
++static void designware_pcie_root_reset(DeviceState *dev)
++{
++    DesignwarePCIERoot *root = DESIGNWARE_PCIE_ROOT(dev);
++    DesignwarePCIEHost *host = designware_pcie_root_to_host(root);
++
++    pci_bridge_reset(dev);
++    root->atu_viewport = 0;
++    for (unsigned int dir = 0; dir < 2; dir++) {
++        for (unsigned int i = 0; i < DESIGNWARE_PCIE_NUM_VIEWPORTS; i++) {
++            DesignwarePCIEViewport *viewport = &root->viewports[dir][i];
++
++            memory_region_set_enabled(&viewport->mem, false);
++            if (dir == DESIGNWARE_PCIE_VIEWPORT_OUTBOUND) {
++                memory_region_set_enabled(&viewport->cfg, false);
++            }
++            viewport->base = 0;
++            viewport->target = 0;
++            viewport->limit = UINT32_MAX;
++            viewport->cr[0] = DESIGNWARE_PCIE_ATU_TYPE_MEM;
++            viewport->cr[1] = 0;
++        }
++    }
++    root->viewports[DESIGNWARE_PCIE_VIEWPORT_INBOUND][0].cr[1] =
++        DESIGNWARE_PCIE_ATU_ENABLE;
++    designware_pcie_update_viewport(root,
++        &root->viewports[DESIGNWARE_PCIE_VIEWPORT_INBOUND][0]);
++    root->msi.base = 0;
++    memset(root->msi.intr, 0, sizeof(root->msi.intr));
++    memory_region_set_enabled(&root->msi.iomem, false);
++    qemu_set_irq(host->pci.msi, 0);
++}
++
+ static void designware_pcie_root_class_init(ObjectClass *klass,
+                                             const void *data)
+ {
+@@ -602,7 +635,7 @@ static void designware_pcie_root_class_init(ObjectClass *klass,
+     k->config_read = designware_pcie_root_config_read;
+     k->config_write = designware_pcie_root_config_write;
+ 
+-    device_class_set_legacy_reset(dc, pci_bridge_reset);
++    device_class_set_legacy_reset(dc, designware_pcie_root_reset);
+     /*
+      * PCI-facing part of the host bridge, not usable without the
+      * host-facing part, which can't be device_add'ed, yet.
 diff --git a/hw/sd/sd.c b/hw/sd/sd.c
 index b1b3b12..56c0162 100644
 --- a/hw/sd/sd.c

@@ -21,6 +21,7 @@
 #include "qom/object.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/bsa.h"
+#include "hw/arm/smmuv3.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
 #include "hw/core/loader.h"
@@ -28,6 +29,8 @@
 #include "hw/core/sysbus.h"
 #include "hw/intc/arm_gic_common.h"
 #include "hw/intc/arm_gicv3_common.h"
+#include "hw/intc/arm_gicv3_its_common.h"
+#include "hw/pci-host/designware.h"
 #include "system/address-spaces.h"
 #include "system/physmem.h"
 #include "system/reset.h"
@@ -171,6 +174,8 @@ static bool rk3588_vgpu;
  * makes dw_pcie_wait_for_link() see Detect.Quiet -> "Device not found" ->
  * -ENODEV instead of an invented Gen.0 x0 link.  Read by rk3588-stubs.c. */
 bool rk3588_pcie_link_up = true;
+static bool rk3588_pcie_its;
+static bool rk3588_pcie_experimental;
 
 struct RkParamHeader {
     uint8_t type;
@@ -774,6 +779,11 @@ static DeviceState *rk3588_create_gic(MachineState *ms)
     qdev_prop_set_uint32(gic, "num-cpu", ms->smp.cpus);
     qdev_prop_set_uint32(gic, "num-irq", RK3588_SPI_COUNT + GIC_INTERNAL);
     qdev_prop_set_bit(gic, "has-security-extensions", true);
+    if (rk3588_pcie_its || rk3588_pcie_experimental) {
+        object_property_set_link(OBJECT(gic), "sysmem",
+                                 OBJECT(get_system_memory()), &error_fatal);
+        qdev_prop_set_bit(gic, "has-lpi", true);
+    }
 
     qlist_append_int(redist_regions, MIN(ms->smp.cpus, RK3588_NR_CPUS));
     qdev_prop_set_array(gic, "redist-region-count", redist_regions);
@@ -790,6 +800,16 @@ static DeviceState *rk3588_create_gic(MachineState *ms)
         memory_region_add_subregion_overlap(get_system_memory(),
                                            RK3588_GICR_BASE + i * 0x20000 + 0x24,
                                            pwrr, 1);
+    }
+    if (rk3588_pcie_its || rk3588_pcie_experimental) {
+        for (unsigned i = 0; i < 2; i++) {
+            DeviceState *its = qdev_new(its_class_name());
+
+            object_property_set_link(OBJECT(its), "parent-gicv3", OBJECT(gic),
+                                     &error_fatal);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(its), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(its), 0, 0xfe640000 + i * 0x20000);
+        }
     }
     return gic;
 }
@@ -1353,6 +1373,29 @@ static void rk3588_init(MachineState *ms)
         rk3588_create_virtio_gpu(gic);
     }
     rk3588_create_stub_regions(get_system_memory());
+    if (rk3588_pcie_experimental) {
+        DeviceState *pcie = qdev_new(TYPE_DESIGNWARE_PCIE_HOST);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(pcie);
+        DeviceState *smmu = qdev_new(TYPE_ARM_SMMUV3);
+        const int smmu_irqs[] = { 0x171, 0x176, 0x16f, 0x173 };
+
+        warn_report("rk3588: experimental PCIe; INTx, migration and reset "
+                    "have not been validated");
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(), 0xa41000000ULL,
+                                            sysbus_mmio_get_region(sbd, 0), 1);
+        object_property_set_link(OBJECT(smmu), "primary-bus",
+                                 OBJECT(PCI_HOST_BRIDGE(pcie)->bus), &error_fatal);
+        object_property_set_link(OBJECT(smmu), "memory",
+                                 OBJECT(get_system_memory()), &error_fatal);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(smmu), &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(), 0xfc900000,
+                                            sysbus_mmio_get_region(SYS_BUS_DEVICE(smmu), 0), 1);
+        for (unsigned irq = 0; irq < ARRAY_SIZE(smmu_irqs); irq++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(smmu), irq,
+                               qdev_get_gpio_in(gic, smmu_irqs[irq]));
+        }
+    }
     rk3588_display_init(ms);
 
     /*
@@ -1470,6 +1513,52 @@ static void rk3588_set_pcie_link(Object *obj, Visitor *v, const char *name,
     visit_type_bool(v, name, &rk3588_pcie_link_up, errp);
 }
 
+static void rk3588_get_pcie_its(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    bool val = rk3588_pcie_its;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_pcie_its(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_pcie_its, errp);
+}
+
+static void rk3588_get_pcie_experimental(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    bool val = rk3588_pcie_experimental;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_pcie_experimental(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_pcie_experimental, errp);
+}
+
+static void rk3588_get_hdmi_connected(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    bool val = rk3588_hdmi_connected;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_hdmi_connected(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_hdmi_connected, errp);
+}
+
 static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1497,6 +1586,24 @@ static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
                                           "the P10 stock-EDK2 path; pass "
                                           "pcie-link=off to model the empty "
                                           "slot the VM has)");
+    object_class_property_add(oc, "pcie-its", "boolean",
+                              rk3588_get_pcie_its, rk3588_set_pcie_its,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "pcie-its",
+                                          "Enable the RK3588 GIC ITS blocks "
+                                          "(experimental PCIe prerequisite)");
+    object_class_property_add(oc, "pcie-experimental", "boolean",
+                              rk3588_get_pcie_experimental,
+                              rk3588_set_pcie_experimental, NULL, NULL);
+    object_class_property_set_description(oc, "pcie-experimental",
+                                          "Experimental Rockchip PCIe host, "
+                                          "SMMU and GIC ITS for PCI devices");
+    object_class_property_add(oc, "hdmi-connected", "boolean",
+                              rk3588_get_hdmi_connected,
+                              rk3588_set_hdmi_connected, NULL, NULL);
+    object_class_property_set_description(oc, "hdmi-connected",
+                                          "Report HDMI0 as connected "
+                                          "(default on; static at boot)");
     rk3588_machine_init(mc);
 }
 

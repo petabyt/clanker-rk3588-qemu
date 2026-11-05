@@ -64,6 +64,7 @@ typedef struct RkStubBlock {
     hwaddr size;
     bool hiword;
     bool track_engine;
+    bool wide_access;
     RkStubReadHook read_hook;
     RkStubReadHook2 read_hook2;
     RkStubWriteHook write_hook;
@@ -155,6 +156,9 @@ static void rk_stub_poweroff_write(hwaddr off, uint64_t value)
  */
 static bool rk_pd_pwr_seen;
 static uint32_t rk_pd_media_armed;
+/* SDMMC domain and its separately controlled memory reset (RK3588 PMU2). */
+static bool rk_pd_sdmmc_off;
+static bool rk_pd_sdmmc_mem_off;
 
 static void rk_stub_atf_poweroff_write(hwaddr off, uint64_t value)
 {
@@ -425,6 +429,8 @@ static void rk_pmu_suspend_arm(int cpu)
 
 void rk3588_pmu_suspend_reset(void)
 {
+    rk_pd_sdmmc_off = false;
+    rk_pd_sdmmc_mem_off = false;
     rk_pmu_suspend_mask = 0;
     if (rk_pmu_suspend_timer) {
         timer_del(rk_pmu_suspend_timer);
@@ -505,6 +511,9 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
         uint32_t wen = (value >> 16) & 0xffff;
 
         rk_pd_pwr_seen = true;
+        if (off == 0x8150 && (wen & (1u << 13))) {
+            rk_pd_sdmmc_off = data & (1u << 13);
+        }
         if (off == 0x814c && data && (data & wen)) {
             if (data & 0x001) {
                 rk_pd_media_armed |= 1u << 1;   /* gpu (panthor row) */
@@ -522,6 +531,10 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
                 rk_pd_media_armed |= 1u << 11;  /* av1 (hantro av1 dec) */
             }
         }
+    }
+    /* PMU2_MEM_PWR_CON1: hiword write-mask bit 13. */
+    if (off == 0x81a4 && (value & (1u << 29))) {
+        rk_pd_sdmmc_mem_off = value & (1u << 13);
     }
 }
 
@@ -608,10 +621,19 @@ static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
     if (off == 0x81f0) {
         return 0xffffffffu;
     }
+    if (off == 0x81f4) {
+        /* SDMMC memory chain is up; resume may reset its powered memory. */
+        return stored | (1u << 5);
+    }
+    if (off == 0x81fc) {
+        return (stored & ~(1u << 5)) |
+               (rk_pd_sdmmc_mem_off ? 1u << 5 : 0);
+    }
     if (off == 0x8290) {
         /* Armed media domains read as OFF (1'b1 = on here).  See the
          * rk_pd_media_armed state comment for the arming rules. */
-        return 0xffffffffu & ~rk_pd_media_armed;
+        return 0xffffffffu & ~rk_pd_media_armed &
+               ~(rk_pd_sdmmc_off ? 1u << 26 : 0);
     }
     return stored;
 }
@@ -724,14 +746,16 @@ static uint64_t rk_stub_grf_boot_read(uint32_t stored, hwaddr off)
 /*
  * HDMI0 hotplug level: the Linux dw_hdmi_qp-rockchip glue detects the
  * connector through RK3588_GRF_SOC_STATUS1 (sys_grf +0x384), bit16 =
- * RK3588_HDMI0_LEVEL_INT.  The model has no cable state, so the
- * "monitor" is permanently plugged (the hpd IRQ is never asserted; a
- * real board powers up with the sink attached too).
+ * RK3588_HDMI0_LEVEL_INT.  The machine selects a static cable state;
+ * the hpd IRQ is never asserted because it cannot change at runtime.
  */
+bool rk3588_hdmi_connected = true;
+
 static uint64_t rk_stub_sysgrf_read(uint32_t stored, hwaddr off)
 {
     if (off == 0x384) {
-        stored |= 1u << 16;      /* HDMI0 HPD: connected */
+        stored = (stored & ~(1u << 16)) |
+                 (rk3588_hdmi_connected ? 1u << 16 : 0);
     }
     return stored;
 }
@@ -1163,6 +1187,15 @@ static const MemoryRegionOps rk_stub_ops = {
     },
 };
 
+/* xHCI has 64-bit registers; QEMU splits these into two 32-bit accesses. */
+static const MemoryRegionOps rk_stub_wide_ops = {
+    .read = rk_stub_read,
+    .write = rk_stub_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 #define MK_MASK(name_, base_, ...) \
     { .name = (name_), .base = (base_), .size = 0x1000, .hiword = true, ##__VA_ARGS__ }
 
@@ -1433,10 +1466,12 @@ static const RkStubBlock rk_stub_blocks[] = {
        it reports "not a DesignWare USB3 DRD Core" and skips the
        controller gracefully) + EHCI/OHCI USB2 hosts. */
     { .name = "dwc3-0", .base = 0xfc000000, .size = 0x400000,
+      .wide_access = true,
       .read_hook2 = rk_stub_dwc3_read2,
       .reset_vals = rk_dwc3_reset_vals, .n_reset_vals = 9 },
     { .name = "dwc3-1", .base = 0xfc400000, .size = 0x400000 },
     { .name = "dwc3-2", .base = 0xfcd00000, .size = 0x400000,
+      .wide_access = true,
       .read_hook2 = rk_stub_dwc3_read2,
       .reset_vals = rk_dwc3_reset_vals, .n_reset_vals = 9 },
     { .name = "ehci0", .base = 0xfc800000, .size = 0x40000,
@@ -1549,6 +1584,8 @@ static const RkStubBlock rk_stub_blocks[] = {
      * (offsets 0x08..0x1c of each 0x20 window) on every domain power
      * transition, so the whole spans need to be mapped.
      */
+    /* Orange Pi 5B vendor U-Boot accesses this adjacent QoS page. */
+    { .name = "qos-boot", .base = 0xfdf32000, .size = 0x1000 },
     { .name = "qos-a", .base = 0xfdf35000, .size = 0xe000 },
     { .name = "qos-b", .base = 0xfdf60000, .size = 0x8000 },
     { .name = "qos-c", .base = 0xfdf70000, .size = 0x3000 },
@@ -1582,7 +1619,8 @@ void rk3588_create_stub_regions(MemoryRegion *sysmem)
             s->tally_n = b->size / 0x10000 + 1;
         }
 
-        memory_region_init_io(mr, OBJECT(sysmem), &rk_stub_ops, s,
+        memory_region_init_io(mr, OBJECT(sysmem),
+                              b->wide_access ? &rk_stub_wide_ops : &rk_stub_ops, s,
                               b->name, b->size);
         memory_region_add_subregion(sysmem, b->base, mr);
     }

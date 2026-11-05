@@ -11,7 +11,7 @@ Prerequisites (inside the repo this script lives in):
   atf/build/rk3588/release/bl31/bl31.elf
   u-boot/u-boot.bin, u-boot/dts/dt.dtb
   images/armbian/vmlinuz-6.18.43-current-rockchip64
-  images/armbian/rk3588s-orangepi-5-vgpu-boot.dtb
+  images/armbian/rk3588s-orangepi-5-all.dtb   (make all-dtb; override with --dtb)
   <image>  - the prepared Armbian KDE image (root pw empty, user opi
              autologin into the Plasma Wayland session)
 
@@ -51,6 +51,9 @@ def parse_args():
                    help="Armbian KDE desktop image (.img)")
     p.add_argument("--qemu", default=None,
                    help="qemu-system-aarch64 binary (default: auto)")
+    p.add_argument("--dtb", default=None,
+                   help="guest boot DTB (default: images/armbian/"
+                        "rk3588s-orangepi-5-all.dtb, `make all-dtb`)")
     return p.parse_args()
 
 
@@ -83,6 +86,11 @@ class Guest:
                                      cwd=ROOT, env=env)
         self._buf = bytearray()
         self._total = 0
+        # Rolling window kept for since()/wait() slicing.  64 KB was enough
+        # for pattern matching during boot, but scripts/run-coverage.py
+        # slices multi-hundred-KB dumps (journalctl) out of this window, so
+        # keep 16 MB; the cost is only memory.
+        self.buf_limit = 16 * 1024 * 1024
         self._lock = threading.Lock()
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -98,8 +106,8 @@ class Guest:
             with self._lock:
                 self._buf.extend(chunk)
                 self._total += len(chunk)
-                if len(self._buf) > 65536:
-                    del self._buf[: len(self._buf) - 65536]
+                if len(self._buf) > self.buf_limit:
+                    del self._buf[: len(self._buf) - self.buf_limit]
             try:
                 sys.stdout.flush()
                 out.write(chunk)
@@ -204,9 +212,10 @@ def main():
     uboot = os.path.join(ROOT, "u-boot/u-boot.bin")
     qdtb = os.path.join(ROOT, "u-boot/dts/dt.dtb")
     vmlinuz = os.path.join(ROOT, "images/armbian/vmlinuz-6.18.43-current-rockchip64")
-    gdtb = os.path.join(ROOT, "images/armbian/rk3588s-orangepi-5-vgpu-boot.dtb")
+    gdtb = (args.dtb or os.path.join(ROOT, "images", "armbian",
+                                     "rk3588s-orangepi-5-all.dtb"))
     for p, w in ((bl31, "TF-A bl31"), (uboot, "u-boot"), (qdtb, "QEMU dtb"),
-                 (vmlinuz, "kernel Image"), (gdtb, "vgpu boot dtb"), (args.image, "image")):
+                 (vmlinuz, "kernel Image"), (gdtb, "boot dtb"), (args.image, "image")):
         need(p, w)
 
     have_desktop = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -216,7 +225,7 @@ def main():
           flush=True)
 
     cmd = [
-        qemu, "-M", "rk3588,vgpu=on", "-serial", "stdio",
+        qemu, "-M", "rk3588,vgpu=on,pcie-link=off", "-serial", "stdio",
         "-bios", bl31,
         "-device", f"loader,file={uboot},addr=0x800000,force-raw=on",
         "-device", f"loader,file={vmlinuz},addr=0x02000000,force-raw=on",

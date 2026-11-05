@@ -28,6 +28,9 @@ extern bool rk3588_atf_mode;
  */
 extern bool rk3588_pcie_link_up;
 
+/* Static HDMI0 hotplug level, selected by the machine before boot. */
+extern bool rk3588_hdmi_connected;
+
 /*
  * Machine hook (rk3588.c): the PMU stub calls this when TF-A writes
  * core_pm_sft_wakeup_en to PMU2_CPU_AUTO_PWR_CON(cpu) (CPU_ON, perf.md A2).
