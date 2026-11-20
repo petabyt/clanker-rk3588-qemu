@@ -78,6 +78,7 @@ struct RkDisplay {
     Notifier done;              /* machine-init-done -> create console */
     QemuConsole *con;
     bool surface_ready;
+    bool indexed_surface;
     hwaddr fb_addr;
     uint64_t fb_stride;
     uint32_t width, height;
@@ -121,6 +122,81 @@ static bool rk_display_get_window(uint32_t *ctlp, uint32_t *addrp,
     return !!(*ctlp & 1);
 }
 
+/* ESmart2 BPP08, VP2 and nearest-neighbor scaling as used by the SRAM demo.
+ * The palette's high byte and writes while lookup is enabled remain unknown. */
+static bool rk_display_indexed(RkDisplay *s, uint32_t addr, uint32_t vir)
+{
+    uint32_t act, dsp, pos, hact, vact, lutsel, ctrl, scale;
+    uint32_t palette[256];
+    uint32_t sw, sh, dw, dh, ox, oy, width, height;
+    hwaddr stride, mapsize, requested;
+    uint8_t *pixels;
+    DisplaySurface *ds;
+
+    physical_memory_read(VOP2_BASE + 0x58, &lutsel, 4);
+    physical_memory_read(VOP2_ESMART2, &ctrl, 4);
+    if (!(lutsel & (1 << 4)) || ((lutsel >> 5) & 7) != 2 ||
+        !(ctrl & (1 << 4))) {
+        return false;
+    }
+    physical_memory_read(VOP2_ESMART2 + 0x20, &act, 4);
+    physical_memory_read(VOP2_ESMART2 + 0x24, &dsp, 4);
+    physical_memory_read(VOP2_ESMART2 + 0x28, &pos, 4);
+    physical_memory_read(VOP2_ESMART2 + 0x30, &scale, 4);
+    physical_memory_read(VOP2_BASE + 0xe4c, &hact, 4);
+    physical_memory_read(VOP2_BASE + 0xe54, &vact, 4);
+    sw = (act & 0xffff) + 1;
+    sh = (act >> 16) + 1;
+    dw = (dsp & 0xffff) + 1;
+    dh = (dsp >> 16) + 1;
+    ox = pos & 0xffff;
+    oy = pos >> 16;
+    width = (hact & 0xffff) - (hact >> 16);
+    height = (vact & 0xffff) - (vact >> 16);
+    stride = (hwaddr)vir * 4;
+    if (!width || width > 4096 || !height || height > 4096 ||
+        sw > 4096 || sh > 4096 || dw > 4096 || dh > 4096 ||
+        stride < sw || stride > 16384 || ox >= width || oy >= height ||
+        (sw != dw && (scale & 3) != 1) ||
+        (sh != dh && ((scale >> 4) & 3) != 1)) {
+        return false;
+    }
+    requested = stride * (sh - 1) + sw;
+    mapsize = requested;
+    pixels = physical_memory_map(addr, &mapsize, false);
+    if (!pixels || mapsize != requested) {
+        if (pixels) {
+            physical_memory_unmap(pixels, mapsize, false, 0);
+        }
+        return false;
+    }
+    physical_memory_read(VOP2_BASE + 0x6000, palette, sizeof(palette));
+    if (!s->surface_ready || !s->indexed_surface || s->width != width ||
+        s->height != height) {
+        ds = qemu_create_displaysurface(width, height);
+        qemu_console_set_surface(s->con, ds);
+        s->surface_ready = true;
+        s->indexed_surface = true;
+        s->width = width;
+        s->height = height;
+    }
+    ds = qemu_console_surface(s->con);
+    memset(surface_data(ds), 0, surface_stride(ds) * height);
+    for (uint32_t y = 0; y < MIN(dh, height - oy); y++) {
+        uint32_t *dst = (uint32_t *)(surface_data(ds) +
+                                     (oy + y) * surface_stride(ds));
+        const uint8_t *row = pixels + (uint64_t)y * sh / dh * stride;
+
+        for (uint32_t x = 0; x < MIN(dw, width - ox); x++) {
+            dst[ox + x] = le32_to_cpu(palette[row[(uint64_t)x * sw / dw]]) &
+                          0xffffff;
+        }
+    }
+    physical_memory_unmap(pixels, mapsize, false, 0);
+    qemu_console_update_full(s->con);
+    return true;
+}
+
 static bool rk_display_gfx_update(void *opaque)
 {
     RkDisplay *s = opaque;
@@ -144,6 +220,13 @@ static bool rk_display_gfx_update(void *opaque)
     if (!(ctl & 1) || vir == 0) {
         return true;
     }
+    if (((ctl >> 1) & 0x1f) == 0x10) {
+        rk_display_indexed(s, addr, vir);
+        return true;
+    }
+    if (((ctl >> 1) & 0x1f) != 0) {
+        return true;
+    }
     width = (act & 0xffff) + 1;
     height = (act >> 16) + 1;
     if (width < 16 || width > 4096 || height < 16 || height > 4096 ||
@@ -153,7 +236,7 @@ static bool rk_display_gfx_update(void *opaque)
     stride = (hwaddr)vir * 4;
 
     /* same scanout config: guest RAM backs the surface, nothing to do */
-    if (s->surface_ready && addr == s->fb_addr && width == s->width &&
+    if (s->surface_ready && !s->indexed_surface && addr == s->fb_addr && width == s->width &&
         height == s->height && stride == s->fb_stride) {
         qemu_console_update_full(s->con);
         return true;
@@ -180,6 +263,7 @@ static bool rk_display_gfx_update(void *opaque)
     qemu_console_set_surface(s->con, ds);   /* frees the old surface */
 
     s->surface_ready = true;
+    s->indexed_surface = false;
     s->fb_addr = addr;
     s->fb_stride = stride;
     s->width = width;

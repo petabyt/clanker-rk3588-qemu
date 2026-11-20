@@ -30,7 +30,8 @@
 #include "rk3588-vop2.h"
 #include "rk3588-display.h"
 
-#define VOP2_REG_WINDOW   0x4200
+/* Include the BPP palette aperture at 0x6000-0x63ff. */
+#define VOP2_REG_WINDOW   0x6400
 #define VOP2_NR_VPS       4
 
 /* VERSION_INFO */

@@ -283,6 +283,16 @@ static uint64_t rk_stub_dwc3_read2(RkStub *s, uint32_t stored, hwaddr off)
     return stored;
 }
 
+/* Genbook USB-A DWC3 revision observed by the pre-DDR probe.  The host
+ * register window is provided separately by the SRAM-mode xHCI adapter. */
+static uint64_t rk_stub_dwc3_usb_a_read(RkStub *s, uint32_t stored, hwaddr off)
+{
+    if (off == 0xc120) {
+        return 0x5533300a;
+    }
+    return stored;
+}
+
 /* Power-on values for the dwc3 windows' read-only hardware config words.
  * The xHCI side additionally needs its extended-capability chain: without
  * at least one PROTOCOL capability (xhci-mem.c walks from HCCPARAMS.xECP)
@@ -1469,7 +1479,8 @@ static const RkStubBlock rk_stub_blocks[] = {
       .wide_access = true,
       .read_hook2 = rk_stub_dwc3_read2,
       .reset_vals = rk_dwc3_reset_vals, .n_reset_vals = 9 },
-    { .name = "dwc3-1", .base = 0xfc400000, .size = 0x400000 },
+    { .name = "dwc3-1", .base = 0xfc400000, .size = 0x400000,
+      .read_hook2 = rk_stub_dwc3_usb_a_read },
     { .name = "dwc3-2", .base = 0xfcd00000, .size = 0x400000,
       .wide_access = true,
       .read_hook2 = rk_stub_dwc3_read2,

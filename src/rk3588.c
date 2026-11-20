@@ -167,6 +167,10 @@ static bool rk3588_bl33_explicit;
  * vgpu=on; the guest DTB carries one virtio,mmio node per transport next to the
  * real gpu@fb000000 node (see scripts/mk-all-dtb.py). */
 static bool rk3588_vgpu;
+/* Raw Mask-ROM-style SRAM payload, not a USB Mask ROM implementation. */
+static bool rk3588_sram_boot;
+static uint8_t *rk3588_sram_image;
+static size_t rk3588_sram_image_size;
 /* PCIe link state served by the APB-client LTSSM_STATUS stub (+0x300).
  * Default on: the P10 stock-EDK2 path polls it for link-up during segment
  * init and must keep its exact prior behaviour.  The Linux audit runs pass
@@ -592,6 +596,17 @@ static void rk3588_bootrom_lite_reset(void *opaque)
     ARMCPU *cpu = ARM_CPU(first_cpu);
     CPUARMState *env;
 
+    if (rk3588_sram_boot) {
+        physical_memory_write(RK3588_DDR_STAGE, rk3588_sram_image,
+                              rk3588_sram_image_size);
+        env = &cpu->env;
+        env->xregs[0] = RK3588_BOOTDATA;
+        env->xregs[1] = 8;
+        env->xregs[30] = 0;
+        env->xregs[31] = RK3588_SRAM_BASE + RK3588_SRAM_SIZE;
+        cpu_set_pc(CPU(cpu), RK3588_DDR_STAGE);
+        return;
+    }
     if (!rk3588_bootrom_lite) {
         return;
     }
@@ -983,6 +998,63 @@ static void rk3588_create_input(DeviceState *gic)
     rk3588_touchpad_gic_line = qdev_get_gpio_in(gic, 278);
 }
 
+/* USB-A diagnostic adapter: QEMU's xHCI operational registers start at
+ * 0x40, whereas the RK3588 core reports CAPLENGTH=0x20.  Only the USB2
+ * port is exposed until the separate SuperSpeed PHY is modelled. */
+static uint64_t rk3588_xhci_caps_read(void *opaque, hwaddr off, unsigned size)
+{
+    switch (off) {
+    case 0x00: return 0x01000020;
+    case 0x04: return 0x01000120; /* one port, interrupter, 32 slots */
+    case 0x08: return 0x0000000f;
+    case 0x10: return 1;          /* 64-bit addressing, 32-byte contexts */
+    case 0x14: return 0x2000;
+    case 0x18: return 0x1000;
+    default: return 0;
+    }
+}
+
+static const MemoryRegionOps rk3588_xhci_caps_ops = {
+    .read = rk3588_xhci_caps_read,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+static void rk3588_create_sram_xhci(DeviceState *gic)
+{
+    DeviceState *dev = qdev_new("sysbus-xhci");
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    MemoryRegion *mem, *caps = g_new0(MemoryRegion, 1);
+    MemoryRegion *oper = g_new0(MemoryRegion, 1);
+    MemoryRegion *runtime = g_new0(MemoryRegion, 1);
+    MemoryRegion *doorbell = g_new0(MemoryRegion, 1);
+
+    dev->id = g_strdup("usb-a");
+    qdev_prop_set_uint32(dev, "p2", 1);
+    qdev_prop_set_uint32(dev, "p3", 0);
+    qdev_prop_set_uint32(dev, "intrs", 1);
+    qdev_prop_set_uint32(dev, "slots", 32);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, 221));
+    mem = sysbus_mmio_get_region(sbd, 0);
+    memory_region_init_io(caps, OBJECT(dev), &rk3588_xhci_caps_ops, NULL,
+                          "rk3588-usba-caps", 0x20);
+    memory_region_init_alias(oper, OBJECT(dev), "rk3588-usba-oper",
+                             mem, 0x40, 0x800);
+    memory_region_init_alias(runtime, OBJECT(dev), "rk3588-usba-runtime",
+                             mem, 0x1000, 0x1000);
+    memory_region_init_alias(doorbell, OBJECT(dev), "rk3588-usba-doorbell",
+                             mem, 0x2000, 0x1000);
+    memory_region_add_subregion_overlap(get_system_memory(), 0xfc400000,
+                                        caps, 1);
+    memory_region_add_subregion_overlap(get_system_memory(), 0xfc400020,
+                                        oper, 1);
+    memory_region_add_subregion_overlap(get_system_memory(), 0xfc401000,
+                                        runtime, 1);
+    memory_region_add_subregion_overlap(get_system_memory(), 0xfc402000,
+                                        doorbell, 1);
+}
+
 static void rk3588_create_usb(DeviceState *gic)
 {
     static const struct {
@@ -997,6 +1069,10 @@ static void rk3588_create_usb(DeviceState *gic)
                                        guest's ohci-platform binds a real
                                        controller with no device behind it */
     };
+
+    if (rk3588_sram_boot) {
+        rk3588_create_sram_xhci(gic);
+    }
 
     for (int i = 0; i < ARRAY_SIZE(ohcis); i++) {
         DeviceState *dev = qdev_new("sysbus-ohci");
@@ -1237,6 +1313,15 @@ static void rk3588_load_firmware(MachineState *ms, uint64_t max_size)
         exit(1);
     }
     g_free(fn);
+    if (rk3588_sram_boot) {
+        if (!len || len > RK3588_SRAM_SIZE - 0x1000) {
+            error_report("rk3588: SRAM firmware must fit in staging SRAM");
+            exit(1);
+        }
+        rk3588_sram_image = (uint8_t *)data;
+        rk3588_sram_image_size = len;
+        return;
+    }
     if (len > max_size) {
         error_report("rk3588: firmware image '%s' (%zu bytes) exceeds RAM",
                      ms->firmware, len);
@@ -1312,8 +1397,14 @@ static void rk3588_init(MachineState *ms)
                            RK3588_SRAM1_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, RK3588_SRAM1_BASE, sram1);
 
+    if (rk3588_sram_boot && (!ms->firmware || ms->kernel_filename || ms->dtb)) {
+        error_report("rk3588: sram-boot requires -bios and excludes -kernel/-dtb");
+        exit(1);
+    }
     rk3588_load_firmware(ms, low_size);
-    rk3588_parse_v2_header(ms);
+    if (!rk3588_sram_boot) {
+        rk3588_parse_v2_header(ms);
+    }
     if (rk3588_bootrom_lite) {
         MemoryRegion *bootrom_ret = g_new(MemoryRegion, 1);
 
@@ -1493,6 +1584,20 @@ static void rk3588_get_vgpu(Object *obj, Visitor *v, const char *name,
     visit_type_bool(v, name, &val, errp);
 }
 
+static void rk3588_get_sram_boot(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    bool val = rk3588_sram_boot;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_sram_boot(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_sram_boot, errp);
+}
+
 static void rk3588_set_vgpu(Object *obj, Visitor *v, const char *name,
                             void *opaque, Error **errp)
 {
@@ -1562,6 +1667,12 @@ static void rk3588_set_hdmi_connected(Object *obj, Visitor *v,
 static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add(oc, "sram-boot", "boolean",
+                              rk3588_get_sram_boot, rk3588_set_sram_boot,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "sram-boot",
+        "Load raw -bios as a pre-DDR SRAM first stage (not USB Mask ROM)");
 
     object_class_property_add(oc, "bl33-base", "uint64",
                               rk3588_get_bl33_base, rk3588_set_bl33_base,
