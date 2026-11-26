@@ -72,6 +72,27 @@ def main():
                 qmp("stop")
 
             qmp("qmp_capabilities")
+            # SYSMEM firewall uses full-width RW, not GRF hiword masks.
+            for address, value in ((0xfe038000, 0xffff0000),
+                                   (0xfe038044, 0x00ff00ff),
+                                   (0xfe0380f0, 0x00000081)):
+                qtest(f"writel {address:#x} {value:#x}")
+                assert int(qtest(f"readl {address:#x}"), 16) == value
+            qtest("writel 0xfe038000 0")
+            assert int(qtest("readl 0xfe038000"), 16) == 0
+            print("PASS: SYSMEM firewall register storage (not DMA enforcement)")
+            # VDEC0's first Rockchip IOMMU window: paging, stall and reset.
+            iommu = 0xfdc38700
+            qtest(f"writel {iommu:#x} 0x12345000")
+            assert int(qtest(f"readl {iommu:#x}"), 16) == 0x12345000
+            qtest(f"writel {iommu + 8:#x} 0")
+            assert int(qtest(f"readl {iommu + 4:#x}"), 16) & 1
+            qtest(f"writel {iommu + 8:#x} 2")
+            assert int(qtest(f"readl {iommu + 4:#x}"), 16) & 4
+            qtest(f"writel {iommu + 8:#x} 6")
+            assert int(qtest(f"readl {iommu:#x}"), 16) == 0
+            assert not int(qtest(f"readl {iommu + 4:#x}"), 16) & 5
+            print("PASS: Rockchip IOMMU register paging, stall and reset")
             # xHCI DCBAAP is a 64-bit register, accessed by vendor U-Boot.
             qtest("writeq 0xfc000050 0x1122334455667788")
             assert int(qtest("readl 0xfc000050"), 16) == 0x55667788

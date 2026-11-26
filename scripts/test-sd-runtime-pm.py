@@ -25,9 +25,9 @@ def main():
     kernel = ROOT / "images/armbian/vmlinuz-6.18.43-current-rockchip64"
     dtb = ROOT / "images/armbian/rk3588s-orangepi-5-armbian.dtb"
     initrd = ROOT / "images/initramfs.bin"
-    bl31 = ROOT / "atf/build/rk3588/release/bl31/bl31.elf"
-    uboot = ROOT / "u-boot/u-boot.bin"
-    uboot_dtb = ROOT / "u-boot/dts/dt.dtb"
+    bl31 = ROOT / "experiments/atf/build/rk3588/release/bl31/bl31.elf"
+    uboot = ROOT / "experiments/u-boot/u-boot.bin"
+    uboot_dtb = ROOT / "experiments/u-boot/dts/dt.dtb"
     for path in (kernel, dtb, initrd, bl31, uboot, uboot_dtb):
         if not path.is_file():
             raise SystemExit(f"missing {path}")

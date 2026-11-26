@@ -1,8 +1,8 @@
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index 4445f16..b39428b 100644
+index 4445f16..3c86624 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -155,6 +155,17 @@ config REALVIEW
+@@ -155,6 +155,19 @@ config REALVIEW
      select DS1338 # I2C RTC+NVRAM
      select USB_OHCI_SYSBUS
  
@@ -16,27 +16,30 @@ index 4445f16..b39428b 100644
 +    select PL330
 +    select PCI_EXPRESS_DESIGNWARE
 +    select ARM_SMMUV3
++    select SSI
++    select SSI_M25P80
 +
  config SBSA_REF
      bool
      default y
 diff --git a/hw/arm/meson.build b/hw/arm/meson.build
-index bcc068d..32cd585 100644
+index bcc068d..6d63363 100644
 --- a/hw/arm/meson.build
 +++ b/hw/arm/meson.build
-@@ -12,6 +12,7 @@ arm_common_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx.c', 'npcm7xx_b
+@@ -12,6 +12,8 @@ arm_common_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx.c', 'npcm7xx_b
  arm_common_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm8xx.c', 'npcm8xx_boards.c'))
  arm_common_ss.add(when: 'CONFIG_REALVIEW', if_true: files('realview.c'))
  arm_common_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa-ref.c'))
-+arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c', 'rk3588/rk3588-i2c.c', 'rk3588/rk3588-i2chid.c', 'rk3588/rk3588-spi.c'))
++arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3528.c', 'rk3588/rk3568.c', 'rk3588/rk3588.c', 'rk3588/dw-apb-uart.c', 'rk3588/rk3588-stubs.c', 'rk3588/rk3588-display.c', 'rk3588/rk3588-dwmshc.c', 'rk3588/rk3588-crypto.c', 'rk3588/rk3588-ddr.c', 'rk3588/rk3588-vop2.c', 'rk3588/rk3588-hdmi.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-edp.c', 'rk3588/rk3588-sdhci.c', 'rk3588/rk3588-timer.c', 'rk3588/rk3588-iommu.c', 'rk3588/rk3588-i2c.c', 'rk3588/rk3588-i2chid.c', 'rk3588/rk3588-spi.c', 'rk3588/rk3588-sfc.c'))
++arm_common_ss.add(when: 'CONFIG_RK3588', if_true: files('rk3588/rk3588-vdec.c'))
  arm_common_ss.add(when: 'CONFIG_STELLARIS', if_true: files('stellaris.c'))
  arm_common_ss.add(when: 'CONFIG_STM32VLDISCOVERY', if_true: files('stm32vldiscovery.c'))
  arm_common_ss.add(when: 'CONFIG_ZYNQ', if_true: files('xilinx_zynq.c'))
 diff --git a/hw/arm/trace-events b/hw/arm/trace-events
-index 1b16f71..1054c38 100644
+index 1b16f71..a98de32 100644
 --- a/hw/arm/trace-events
 +++ b/hw/arm/trace-events
-@@ -96,3 +96,7 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
+@@ -96,3 +96,11 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
  
  # bcm2838.c
  bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
@@ -44,6 +47,22 @@ index 1b16f71..1054c38 100644
 +# rk3588/rk3588-edp.c
 +rk3588_edp_aux(const char *bus, const char *op, uint32_t addr, uint32_t len, uint32_t status) "AUX %s %s addr=0x%03x len=%u status=%u"
 +rk3588_edp_dpcd_write(uint32_t addr, uint32_t val) "DPCD[0x%03x] <- 0x%02x"
++rk3588_vdec_dma_probe(uint32_t addr, uint32_t len, int result, uint32_t sum) "iova=0x%x len=%u result=%d sum=%u"
++rk3588_vdec_reference(uint32_t dst, uint32_t ref, uint32_t info) "dst=0x%x ref=0x%x info=0x%x"
++rk3588_vdec_result(int decoded) "decoded=%d"
++rk3588_vdec_job_data(uint32_t len, uint32_t params_addr, int input_result, int params_result, const char *input_hex, const char *params_hex) "len=%u params=0x%x input_result=%d params_result=%d input=%s params_data=%s"
+diff --git a/hw/block/m25p80.c b/hw/block/m25p80.c
+index 545e0b5..dfbc884 100644
+--- a/hw/block/m25p80.c
++++ b/hw/block/m25p80.c
+@@ -356,6 +356,7 @@ static const FlashPartInfo known_devices[] = {
+     { INFO("w25q32dw",    0xef6016,      0,  64 << 10,  64, ER_4K) },
+     { INFO("w25x64",      0xef3017,      0,  64 << 10, 128, ER_4K) },
+     { INFO("w25q64",      0xef4017,      0,  64 << 10, 128, ER_4K) },
++    { INFO("xm25qh64c",   0x204017,      0,  64 << 10, 128, ER_4K) },
+     { INFO("w25q80",      0xef5014,      0,  64 << 10,  16, ER_4K) },
+     { INFO("w25q80bl",    0xef4014,      0,  64 << 10,  16, ER_4K),
+       .sfdp_read = m25p80_sfdp_w25q80bl },
 diff --git a/hw/pci-host/designware.c b/hw/pci-host/designware.c
 index 00c9449..6dfeedd 100644
 --- a/hw/pci-host/designware.c
@@ -131,9 +150,27 @@ index 00c9449..6dfeedd 100644
       * PCI-facing part of the host bridge, not usable without the
       * host-facing part, which can't be device_add'ed, yet.
 diff --git a/hw/sd/sd.c b/hw/sd/sd.c
-index b1b3b12..56c0162 100644
+index b1b3b12..1259c73 100644
 --- a/hw/sd/sd.c
 +++ b/hw/sd/sd.c
+@@ -162,6 +162,7 @@ struct SDState {
+     /* Static properties */
+ 
+     uint8_t spec_version;
++    uint32_t ocr_voltage;
+     uint64_t boot_part_size;
+     uint64_t rpmb_part_size;
+     BlockBackend *blk;
+@@ -418,8 +419,7 @@ static void sd_ocr_powerup(void *opaque)
+ 
+ static void sd_set_ocr(SDState *sd)
+ {
+-    /* All voltages OK */
+-    sd->ocr = R_OCR_VDD_VOLTAGE_WIN_HI_MASK;
++    sd->ocr = sd->ocr_voltage & R_OCR_VDD_VOLTAGE_WIN_HI_MASK;
+ 
+     if (sd_is_spi(sd)) {
+         /*
 @@ -535,11 +535,15 @@ static void emmc_set_ext_csd(SDState *sd, uint64_t size)
      sd->ext_csd[207] = 0x46; /* Min read perf for 4bit@52Mhz */
      sd->ext_csd[206] = 0x46; /* Min write perf for 4bit@26Mhz */
@@ -193,6 +230,15 @@ index b1b3b12..56c0162 100644
          [20] = {3,  sd_adtc, "WRITE_DAT_UNTIL_STOP", sd_cmd_unimplemented},
          [23] = {2,  sd_ac,   "SET_BLOCK_COUNT", sd_cmd_SET_BLOCK_COUNT},
          [24] = {4,  sd_adtc, "WRITE_SINGLE_BLOCK", sd_cmd_WRITE_SINGLE_BLOCK},
+@@ -3208,6 +3232,8 @@ static const Property sdmmc_common_properties[] = {
+ };
+ 
+ static const Property sd_properties[] = {
++    DEFINE_PROP_UINT32("ocr-voltage", SDState, ocr_voltage,
++                       R_OCR_VDD_VOLTAGE_WIN_HI_MASK),
+     DEFINE_PROP_UINT8("spec_version", SDState,
+                       spec_version, SD_PHY_SPECv3_01_VERS),
+ };
 diff --git a/hw/sd/sdhci-internal.h b/hw/sd/sdhci-internal.h
 index 2116995..2841f62 100644
 --- a/hw/sd/sdhci-internal.h

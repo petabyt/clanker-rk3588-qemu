@@ -3,14 +3,14 @@
 # final screen draws, then let the guest's PSCI_SYSTEM_OFF shut QEMU down
 # (rc must be 0 — this also verifies the shutdown model, see plan.md P8).
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 rm -f /tmp/p9s.log /tmp/p9mon.sock /tmp/p9.ppm qemu-p9.log
 
 timeout 90 build/qemu/qemu-system-aarch64 -M rk3588 -display none \
     -serial file:/tmp/p9s.log \
     -monitor unix:/tmp/p9mon.sock,server,nowait \
-    -bios rk/genbook_demo.img \
+    -bios experiments/rk/genbook_demo.img \
     -d unimp,guest_errors,invalid_mem -D qemu-p9.log &
 QPID=$!
 
@@ -49,7 +49,7 @@ else:
     sys.exit(1)
 
 time.sleep(0.05)
-s.sendall(b"screendump /tmp/p9.ppm\n")
+s.sendall(b"screendump /tmp/p9.ppm hdmi\n")
 time.sleep(0.3)
 EOF
 MON_RC=$?

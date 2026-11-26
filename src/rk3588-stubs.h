@@ -9,7 +9,7 @@
  * (CRU/PMU/IOC/GRF/SGRF/GPIO/PWM/VOP2/eDP...).  See rk3588-stubs.c for
  * the read/write semantics each class needs.
  */
-void rk3588_create_stub_regions(MemoryRegion *sysmem);
+void rk3588_create_stub_regions(MemoryRegion *sysmem, DeviceState *gic);
 
 /*
  * Set by rk3588.c when -bios carries a TF-A (BL31) ELF.  Gates the
@@ -17,6 +17,10 @@ void rk3588_create_stub_regions(MemoryRegion *sysmem);
  * exact prior behaviour.
  */
 extern bool rk3588_atf_mode;
+/* Enable the experimental BootROM's virtual secure OTP. */
+extern bool rk3588_real_bootrom_mode;
+/* Experimental VDEC0 power-domain and restricted decoder behavior. */
+extern bool rk3588_vdec0_power;
 
 /*
  * PCIe link state reported by the APB client's LTSSM_STATUS (+0x300).

@@ -48,6 +48,6 @@ LIST=initramfs.cpio.list
 size=$(stat -c %s initramfs.cpio.gz)
 echo "initramfs.cpio.gz: $size bytes"
 [ "$size" -le 4194304 ] || { echo "too big for the 4 MiB slot" >&2; exit 1; }
-cp initramfs.cpio.gz ../images/initramfs.bin
-truncate -s 4194304 ../images/initramfs.bin
-echo "images/initramfs.bin: $(stat -c %s ../images/initramfs.bin) bytes (padded)"
+cp initramfs.cpio.gz ../../images/initramfs.bin
+truncate -s 4194304 ../../images/initramfs.bin
+echo "images/initramfs.bin: $(stat -c %s ../../images/initramfs.bin) bytes (padded)"

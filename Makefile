@@ -30,9 +30,10 @@ APPDIR        := $(BUILD_DIR)/AppDir
 APPIMG_DESKTOP := packaging/rk3588-qemu.desktop
 APPIMG_ICON   := packaging/rk3588-qemu.png
 
-.PHONY: all qemu rk appimage run-sd trace-sd regress sd-own-bl31 sd-v116 run-v116 \
+.PHONY: all qemu rk appimage run-rk-menu test-rk-menu test-rk-dwc3 run-sd trace-sd regress sd-own-bl31 sd-v116 run-v116 \
 	run-linux run-linux-edp linux-initramfs linux-dtb all-dtb clean distclean help \
-	run-opi5-raw test-boot-devices test-pcie-config test-pcie-gpu
+	run-opi5-raw test-boot-devices test-pcie-config test-pcie-gpu test-rk3528-uboot test-rk3528-ddr test-rk3568-uboot \
+	test-rk3568-ddr build-rk3568-sd test-rk3568-sd build-rk3528-sd test-rk3528-sd
 
 all: qemu rk
 
@@ -45,6 +46,81 @@ run-opi5-raw: qemu
 
 test-boot-devices: qemu
 	python3 scripts/test-rk-boot-devices.py --qemu $(QEMU_BIN)
+
+$(BUILD_DIR)/dwc3-test-guest.elf: scripts/dwc3-test-guest.c futo-bootloader/rk/usb-poc/entry.S futo-bootloader/rk/usb-poc/sram.ld
+	@mkdir -p $(BUILD_DIR)
+	aarch64-linux-gnu-gcc -Os -ffreestanding -fno-stack-protector -nostdlib \
+		-Wl,--build-id=none,-T,futo-bootloader/rk/usb-poc/sram.ld \
+		futo-bootloader/rk/usb-poc/entry.S scripts/dwc3-test-guest.c -o $@
+
+$(BUILD_DIR)/dwc3-test-guest.bin: $(BUILD_DIR)/dwc3-test-guest.elf
+	aarch64-linux-gnu-objcopy -O binary $< $@
+
+$(BUILD_DIR)/dwc3-maskrom-harness.elf: scripts/dwc3-maskrom-harness.c futo-bootloader/rk/usb-poc/entry.S futo-bootloader/rk/usb-poc/sram.ld
+	@mkdir -p $(BUILD_DIR)
+	aarch64-linux-gnu-gcc -Os -ffreestanding -fno-stack-protector -nostdlib \
+		-Wl,--build-id=none,-T,futo-bootloader/rk/usb-poc/sram.ld \
+		futo-bootloader/rk/usb-poc/entry.S scripts/dwc3-maskrom-harness.c -o $@
+
+$(BUILD_DIR)/dwc3-maskrom-harness.bin: $(BUILD_DIR)/dwc3-maskrom-harness.elf
+	aarch64-linux-gnu-objcopy -O binary $< $@
+
+test-rk-dwc3: qemu $(BUILD_DIR)/dwc3-test-guest.bin $(BUILD_DIR)/dwc3-maskrom-harness.bin
+	$(MAKE) -C futo-bootloader/rk/usb-poc build/menu.bin
+	python3 scripts/test-rk-dwc3-idle.py $(QEMU_BIN)
+	python3 scripts/test-rk-dwc3-cable.py $(QEMU_BIN)
+	python3 scripts/test-rk-dwc3-control.py $(QEMU_BIN)
+	python3 scripts/test-rk-dwc3-guest.py $(QEMU_BIN) $(BUILD_DIR)/dwc3-test-guest.bin
+	python3 scripts/test-rk-dwc3-maskrom.py $(QEMU_BIN) $(BUILD_DIR)/dwc3-maskrom-harness.bin
+
+.PHONY: test-rk-otg-cdc-poc test-rk-otg-cdc-ddr test-rk-otg-cdc-linux
+test-rk-otg-cdc-poc: qemu
+	$(MAKE) -C futo-bootloader/rk/usb-poc build/otg-cdc-poc.bin
+	python3 scripts/test-rk-dwc3-guest.py $(QEMU_BIN) futo-bootloader/rk/usb-poc/build/otg-cdc-poc.bin --stream
+
+test-rk-otg-cdc-ddr: qemu
+	$(MAKE) -C futo-bootloader/rk/usb-poc build/otg-cdc-ddr.bin
+	python3 scripts/test-rk-dwc3-guest.py $(QEMU_BIN) futo-bootloader/rk/usb-poc/build/otg-cdc-ddr.bin --stream --ddr
+
+test-rk-otg-cdc-linux: qemu
+	$(MAKE) -C futo-bootloader/rk/usb-poc build/otg-cdc-linux.bin
+	python3 scripts/test-rk-dwc3-guest.py $(QEMU_BIN) futo-bootloader/rk/usb-poc/build/otg-cdc-linux.bin --stream --ddr --linux
+
+.PHONY: test-rk-menu-otg
+test-rk-menu-otg: qemu
+	$(MAKE) -C futo-bootloader/rk/usb-poc build/menu-fit.bin
+	python3 futo-bootloader/rk/usb-poc/test-menu-otg.py
+
+# Experimental direct U-Boot boot; no BootROM, DDR image or storage.
+test-rk3568-uboot: qemu
+	sh scripts/build-rk3568-uboot.sh
+	python3 scripts/test-rk3568-uboot.py
+
+# Direct-loaded ROCK 2A U-Boot only; no BootROM, DDR, storage or TF-A.
+test-rk3528-uboot: qemu
+	sh scripts/build-rk3528-uboot.sh
+	python3 scripts/test-rk3528-uboot.py
+
+# Experimental raw DDR -> host-loaded U-Boot, not SPI/SPL/TF-A boot.
+test-rk3528-ddr: qemu
+	sh scripts/build-rk3528-uboot.sh
+	python3 scripts/test-rk3528-uboot.py "$(RK3528_DDR)"
+
+build-rk3528-sd:
+	sh scripts/build-rk3528-sd.sh "$(RK3528_DDR)" "$(RK3528_BL31)"
+
+test-rk3528-sd: qemu build-rk3528-sd
+	python3 scripts/test-rk3528-sd.py
+
+# Point RK3568_DDR at the unmodified rkbin v1.26 image; not redistributed.
+test-rk3568-ddr: qemu
+	python3 scripts/test-rk3568-ddr.py "$(RK3568_DDR)"
+
+build-rk3568-sd:
+	sh scripts/build-rk3568-sd.sh "$(RK3568_DDR)"
+
+test-rk3568-sd: qemu build-rk3568-sd
+	python3 scripts/test-rk3568-sd.py
 
 test-pcie-config: qemu
 	python3 scripts/test-rk-pcie-its.py --qemu $(QEMU_BIN)
@@ -85,7 +161,7 @@ $(QEMU_BIN): $(QEMU_BUILD)/config.status FORCE
 	ninja -C $(QEMU_BUILD) qemu-system-aarch64
 
 rk:
-	$(MAKE) -C rk opi5.bin genbook.bin
+	$(MAKE) -C experiments/rk opi5.bin genbook.bin
 
 # Portable AppImage of qemu-system-aarch64 (linuxdeploy + appimagetool).
 # linuxdeploy lays down AppDir/usr/bin + bundled shared libraries; pc-bios is
@@ -106,10 +182,22 @@ appimage: qemu
 	APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 appimagetool \
 		$(APPDIR) $(APPIMAGE)
 
+# The firmware is an independent, emulator-only rk-fork experiment.
+run-rk-menu:
+	$(MAKE) -C futo-bootloader/rk/usb-poc build/menu.bin
+	./$(APPIMAGE) -M rk3588,sram-boot=on -icount shift=6 \
+		-bios futo-bootloader/rk/usb-poc/build/menu.bin -serial stdio -monitor none -nodefaults \
+		-drive 'if=none,id=stick,format=raw,readonly=on,file=Armbian_26.8.1_Orangepi5_resolute_current_6.18.43_kde-plasma_desktop.img' \
+		-device usb-storage,bus=menu-usb.0,port=1.2,drive=stick
+
+test-rk-menu:
+	$(MAKE) -C futo-bootloader/rk/usb-poc build/menu.bin
+	python3 futo-bootloader/rk/usb-poc/test-menu.py ./$(APPIMAGE)
+
 # Helper runs. Each uses a scratch copy of the stock SD image (EDK2 writes to
 # the card) and writes logs under $(LOG_DIR), never into the repo.
 LOG_DIR   := /tmp/opencode
-STOCK_SD  := edk2/orangepi-5_UEFI_Release_v1.1.img
+STOCK_SD  := experiments/edk2/orangepi-5_UEFI_Release_v1.1.img
 SCRATCH_SD := $(LOG_DIR)/sd-scratch.img
 SD_TIMEOUT ?= 90
 QEMU_RK3588 = $(QEMU_BIN) -M rk3588 -nographic -serial mon:stdio
@@ -131,7 +219,7 @@ trace-sd: $(QEMU_BIN) $(SCRATCH_SD)
 OWN_BL31_BIN := $(LOG_DIR)/bl31-own.bin
 OWN_BL31_SD  := $(LOG_DIR)/sd-own-bl31.img
 
-$(OWN_BL31_BIN): atf/build/rk3588/release/bl31/bl31.elf
+$(OWN_BL31_BIN): experiments/atf/build/rk3588/release/bl31/bl31.elf
 	mkdir -p $(LOG_DIR)
 	aarch64-linux-gnu-objcopy -O binary -j .ro -j .data $< $@
 
@@ -144,7 +232,7 @@ $(OWN_BL31_SD): $(OWN_BL31_BIN) $(STOCK_SD) scripts/own-bl31-sd.py
 # Scratch card with the v1.16 DDR TPL swapped into the stock idbloader slot
 # (tpl@0x8800, size 0x12800; v1.16 blob is 0x126d8). The stock image ships
 # v1.18 there - this image boots the blob the board reversing targets.
-V116_TPL   := rk/img/rk3588_ddr_lp4_2112MHz_lp5_2400MHz_v1.16.bin
+V116_TPL   := experiments/rk/img/rk3588_ddr_lp4_2112MHz_lp5_2400MHz_v1.16.bin
 V116_SD    := $(LOG_DIR)/sd-v116.img
 
 $(V116_SD): $(STOCK_SD) $(V116_TPL)
@@ -171,15 +259,15 @@ LINUX_DTB   := images/rk3588-qemu.dtb
 INITRD_BIN  := images/initramfs.bin
 
 linux-initramfs:
-	initramfs/build.sh
+	experiments/initramfs/build.sh
 
 # eMMC test image (P11): MBR + ext4 partition, mount rootfs proof.
 images/emmc.img: scripts/mk-emmc-img.py
 	python3 scripts/mk-emmc-img.py
 
-linux-dtb: dts/rk3588-qemu.dts
+linux-dtb: experiments/dts/rk3588-qemu.dts
 	linux/linux-7.2.9/scripts/dtc/dtc -Wno-unit_address_vs_reg \
-		-I dts -O dtb -o /tmp/opencode/p5.dtb dts/rk3588-qemu.dts
+		-I dts -O dtb -o /tmp/opencode/p5.dtb experiments/dts/rk3588-qemu.dts
 	python3 -c "d=open('/tmp/opencode/p5.dtb','rb').read(); \
 	open('$(LINUX_DTB)','wb').write(d+b'\0'*(0x20000-len(d)))"
 
@@ -227,17 +315,17 @@ ALL_DTB := images/armbian/rk3588s-orangepi-5-all.dtb
 all-dtb: $(ALL_DTB)
 $(ALL_DTB): scripts/mk-all-dtb.py images/armbian/rk3588s-orangepi-5-armbian.dtb
 	python3 scripts/mk-all-dtb.py images/armbian/rk3588s-orangepi-5-armbian.dtb $@ \
-		--dts dts/rk3588s-orangepi-5-all.dts
+		--dts experiments/dts/rk3588s-orangepi-5-all.dts
 
 run-linux-stock: $(QEMU_BIN) $(STOCK_SMP_DTB) $(INITRD_BIN) images/emmc.img
 	mkdir -p $(LOG_DIR)
 	-timeout 290 $(QEMU_RK3588) \
-		-bios atf/build/rk3588/release/bl31/bl31.elf \
-		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-bios experiments/atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=experiments/u-boot/u-boot.bin,addr=0x800000,force-raw=on \
 		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
 		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
 		-device loader,file=$(STOCK_SMP_DTB),addr=0x0a100000,force-raw=on \
-		-dtb u-boot/dts/dt.dtb \
+		-dtb experiments/u-boot/dts/dt.dtb \
 		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
 		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-stock-int.log \
 		> $(LOG_DIR)/run-linux-stock.txt 2>&1
@@ -248,12 +336,12 @@ run-linux-stock: $(QEMU_BIN) $(STOCK_SMP_DTB) $(INITRD_BIN) images/emmc.img
 run-linux-emmc: $(QEMU_BIN) $(EMMC_DTB) $(INITRD_BIN) images/emmc.img
 	mkdir -p $(LOG_DIR)
 	-timeout 290 $(QEMU_RK3588) \
-		-bios atf/build/rk3588/release/bl31/bl31.elf \
-		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-bios experiments/atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=experiments/u-boot/u-boot.bin,addr=0x800000,force-raw=on \
 		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
 		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
 		-device loader,file=$(EMMC_DTB),addr=0x0a100000,force-raw=on \
-		-dtb u-boot/dts/dt.dtb \
+		-dtb experiments/u-boot/dts/dt.dtb \
 		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
 		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-emmc-int.log \
 		> $(LOG_DIR)/run-linux-emmc.txt 2>&1
@@ -262,12 +350,12 @@ run-linux-emmc: $(QEMU_BIN) $(EMMC_DTB) $(INITRD_BIN) images/emmc.img
 run-linux: $(QEMU_BIN) $(LINUX_DTB) $(INITRD_BIN) images/emmc.img
 	mkdir -p $(LOG_DIR)
 	-timeout 110 $(QEMU_RK3588) \
-		-bios atf/build/rk3588/release/bl31/bl31.elf \
-		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-bios experiments/atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=experiments/u-boot/u-boot.bin,addr=0x800000,force-raw=on \
 		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
 		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
 		-device loader,file=$(LINUX_DTB),addr=0x0a100000,force-raw=on \
-		-dtb u-boot/dts/dt.dtb \
+		-dtb experiments/u-boot/dts/dt.dtb \
 		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
 		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-int.log \
 		> $(LOG_DIR)/run-linux.txt 2>&1
@@ -302,12 +390,12 @@ run-linux-edp: $(QEMU_BIN) $(EDP_DTB) $(INITRD_BIN) images/emmc.img
 	mkdir -p $(LOG_DIR)
 	rm -f $(LOG_DIR)/run-linux-edp-trace.log
 	-timeout 130 $(QEMU_RK3588) \
-		-bios atf/build/rk3588/release/bl31/bl31.elf \
-		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-bios experiments/atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=experiments/u-boot/u-boot.bin,addr=0x800000,force-raw=on \
 		-device loader,file=$(LINUX_IMAGE),addr=0x02000000,force-raw=on \
 		-device loader,file=$(INITRD_BIN),addr=0x09000000,force-raw=on \
 		-device loader,file=$(EDP_DTB),addr=0x0a100000,force-raw=on \
-		-dtb u-boot/dts/dt.dtb \
+		-dtb experiments/u-boot/dts/dt.dtb \
 		-drive if=sd,file=images/emmc.img,format=raw,unit=1 \
 		-trace enable=rk3588_edp_*,file=$(LOG_DIR)/run-linux-edp-trace.log \
 		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/run-linux-edp-int.log \
@@ -327,15 +415,15 @@ sd-own-bl31: $(QEMU_BIN) $(OWN_BL31_SD)
 regress: $(QEMU_BIN)
 	mkdir -p $(LOG_DIR)
 	-timeout 45 $(QEMU_RK3588) \
-		-bios atf/build/rk3588/release/bl31/bl31.elf \
-		-device loader,file=u-boot/u-boot.bin,addr=0x800000,force-raw=on \
-		-dtb u-boot/dts/dt.dtb -d int,invalid_mem,guest_errors \
+		-bios experiments/atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=experiments/u-boot/u-boot.bin,addr=0x800000,force-raw=on \
+		-dtb experiments/u-boot/dts/dt.dtb -d int,invalid_mem,guest_errors \
 		-D $(LOG_DIR)/reg-uboot.log > $(LOG_DIR)/reg-uboot.txt 2>&1
 	@echo "U-Boot: prompt=$$(tr -d '\r' < $(LOG_DIR)/reg-uboot.txt | grep -c '=>') invalid=$$(grep -ci invalid $(LOG_DIR)/reg-uboot.log)"
 	-timeout 150 $(QEMU_RK3588) \
-		-bios atf/build/rk3588/release/bl31/bl31.elf \
-		-device loader,file=edk2/BL33_AP_UEFI.Fv,addr=0x200000,force-raw=on \
-		-machine bl33-base=0x200000 -dtb u-boot/dts/dt.dtb \
+		-bios experiments/atf/build/rk3588/release/bl31/bl31.elf \
+		-device loader,file=experiments/edk2/BL33_AP_UEFI.Fv,addr=0x200000,force-raw=on \
+		-machine bl33-base=0x200000 -dtb experiments/u-boot/dts/dt.dtb \
 		-d int,invalid_mem,guest_errors -D $(LOG_DIR)/reg-edk2.log > $(LOG_DIR)/reg-edk2.txt 2>&1
 	@echo "EDK2: banner=$$(tr -d '\r' < $(LOG_DIR)/reg-edk2.txt | grep -ci 'UEFI\|Boot Manager') invalid=$$(grep -ci invalid $(LOG_DIR)/reg-edk2.log)"
 
@@ -344,7 +432,7 @@ clean:
 	rm -f $(APPIMAGE)
 
 distclean: clean
-	$(MAKE) -C rk clean
+	$(MAKE) -C experiments/rk clean
 
 help:
 	@echo "Targets:"

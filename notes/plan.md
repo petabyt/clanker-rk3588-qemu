@@ -374,7 +374,7 @@ P9  (user request 2026-10-07; ordered after P4, labels kept) Basic VOP2
     surface (simpler than the full analogix eDP AUX/DPCD/EDID model of P6; can
     come before it).
     STATUS: DONE (2026-10-08). Exit command:
-      $ ./p9-exit.sh
+      $ scripts/p9-exit.sh
     Exit output:
       qemu-system-aarch64: rk3588: v2 image, ddr@8800+12e00 os@1b600+28000
       qemu rc=0 (0 = guest PSCI shutdown), monitor rc=0
@@ -446,7 +446,7 @@ P9  (user request 2026-10-07; ordered after P4, labels kept) Basic VOP2
     - The demo framebuffer is 0xd0000000 1920x1080 (plat_get_framebuffer);
       demo/bmp.c draws 0x4398d7 background + white font into it, which the
       screendump check verifies pixel-for-pixel.
-    - p9-exit.sh: boots with -display none, -serial file:/tmp/p9s.log,
+    - scripts/p9-exit.sh: boots with -display none, -serial file:/tmp/p9s.log,
       -monitor unix:socket (connect with retry), -D qemu-p9.log; waits for
       the payload's last draw ("Memory description map:") + 0.05s, sends HMP
       `screendump /tmp/p9.ppm` and does NOT quit — the guest's
@@ -2328,10 +2328,21 @@ P11 (user directive 2026-10-10, next step toward the unmodified-Armbian goal)
   Driver/prep scripts: /tmp/opencode/kde-prep.py, kde-boot1.py (image
   now dirty: root pw empty, sddm.conf.d/99-force-x11.conf present).
 
-  5e. virtio-gpu at the Mali slot (IN PROGRESS): goal = render node +
-  mature KMS for the guest (Plasma has no X11 session; kwin_wayland needs
-  GBM+render node; host container has NO /dev/dri and no kernel modules,
-  so virgl host GL is unavailable - plain virtio-gpu only).
+  5e. virtio-gpu at the Mali slot (COMPLETE 2026-10-14, see gpu-plan.md
+  RESULT): goal = render node + mature KMS for the guest (Plasma has no
+  X11 session; kwin_wayland needs GBM+render node; host container has
+  NO /dev/dri and no kernel modules, so virgl host GL is unavailable -
+  plain virtio-gpu only).  EXIT BAR MET: with
+  MESA_LOADER_DRIVER_OVERRIDE=zink + VK_ICD_FILENAMES=lvp_icd.json +
+  KWIN_DRM_DEVICES=/dev/dri/card0 (in /etc/environment.d/99-vgpu.conf),
+  kwin_wayland scans out card0 (virtio_gpu) — dri/0 state shows
+  plane-0 fb allocated by=kwin_wayland, XR24 1920x1080, crtc-0 active
+  — and Konsole launches and stays running on the Plasma desktop.
+  lavapipe/llvmpipe Vulkan works via Wayland WSI (vkcube confirms).
+  B2 (behavioral IOMMU windows for all 15 rockchip iommu regions)
+  landed in src/rk3588-iommu.c + src/rk3588.c; B3 (pm-domain pwr_off)
+  reverted (broke probe).  H2 (host virgl) not needed.
+  Historical detail (pre-revision boots 2-6):
   - QEMU: rebuilt with libvirglrenderer-dev (virtio-gpu-gl-device now
     exists but requires display_opengl -> -display egl-headless -> needs
     a HOST DRM render node for GBM init -> dead end in this container;
@@ -2485,3 +2496,918 @@ P11 (user directive 2026-10-10, next step toward the unmodified-Armbian goal)
   the PMU-mirror + ACMD23 changes.  The Armbian image file is now
   DIRTY (root pw empty, gdm enabled, first-boot consumed) - that is
   the working state; re-extract from the .xz for pristine boots.
+
+## DEFERRED: virtio-gpu / display work (2026-10-13, REVISED 2026-10-14)
+  EXECUTED 2026-10-14 — see gpu-plan.md RESULT section (exit bar met:
+  Konsole open on Plasma desktop via virtio-gpu scanout; G0/G2/G3'/G4'
+  complete; B2 landed, B3 reverted; env combo in
+  /etc/environment.d/99-vgpu.conf).  Historical note retained below.
+
+  The virtio-gpu "usable by guest userspace" plan was written up in
+  ./gpu-plan.md and revised 2026-10-14 (Path B, guest-side only;
+  success bar = Konsole open on the Plasma desktop, works-at-all, no
+  speed gate; G3 uses KWIN_DRM_DEVICES not a rockchipdrm blacklist;
+  H2 host virgl is a conditional unblocker only).  The 2026-10-14
+  ~233s hang was root-caused as the P16 B2/B3 deferred-probe storm;
+  B2 (behavioral IOMMU) fixed it, B3 (pm-domain pwr_off) reverted
+  after breaking rockchip-pm-domain probe.  With B2 in place, G0
+  baseline is stable (~90-100s login) and the full G2→G3'→G4' chain
+  completed: lavapipe/zink env makes kwin present through virtio-gpu
+  card0, Konsole launches and stays running.
+
+## P16 boot-speed plan (2026-10-13)
+  Multicore (PSCI CPU_ON / PMU CPU power controller / MPIDR fix) +
+  timeout devices (virtio-net+SLIRP, all-window IOMMU, pm-domain off,
+  rockchip-rng, i2c+hym8563, VOP2 dsp_hold) - full plan with evidence
+  and exit bars in ./perf.md (user-agreed order: SMP -> timeouts;
+  virtio-gpu deferred to ./gpu-plan.md).
+
+## P16 Phase A + B1 DONE (2026-10-14)
+  A (SMP/PSCI secondary bring-up) + B1 (virtio-net + user SLIRP) landed
+  per perf.md; B2-B7 still open.  All changes in ./src (rk3588.c,
+  rk3588-stubs.c/h), Makefile (stock-smp DTB strip), dts/ (new
+  rk3588s-orangepi-5-vgpu-boot.dts source), scripts/run-desktop.py
+  (netdev+virtio-net).  qemu.patch untouched (no QEMU-tree edits).
+
+  Root causes fixed:
+  1. MPIDR: affinity was i / 0x100|(i-4) -> now (uint64_t)i<<8, matching
+     every guest DTB (reg 0x0,0x100..0x700) and TF-A plat_core_pos_by_mpidr.
+  2. PMU CPU power controller: rk_stub_pmu_write now handles
+     PMU2_CPU_AUTO_PWR_CON(cpu)=0x8010+4*i (hiword mask decode); on
+     core_pm_sft_wakeup_en (bit3) calls rk3588_pmu_cpu_wake(cpu) which
+     async_run_on_cpu's: cpu_reset -> arm_emulate_firmware_reset(cs,3)
+     -> halted=0 -> arm_set_cpu_power_state(PSCI_ON) ->
+     cpu_set_pc(0xFF100000) (PMUSRAM pmu_cpuson_entrypoint).  Wake-state
+     array cleared in qemu_register_reset hook (rk3588_smp_reset).
+  3. run-linux-stock: stock DTB keeps cpu-idle-states; with 8 CPUs the
+     secondaries idle immediately and PSCI suspend drives TF-A into
+     cortex_a76_core_pwr_dwn (CPUECTLR_EL3 s3_0_c15_c2_7 UNDEF under
+     TCG -> warm reset).  Makefile now builds STOCK_SMP_DTB with the
+     cpu-idle-states strip (same as EMMC_DTB already did).
+  4. B1: 4th virtio-mmio transport 0xfb003000 SPI 98 (SPI 95 taken by
+     video-codec@fdc38000); net@fb003000 virtio,mmio DTB node added;
+     run-desktop.py puts -netdev user,id=net0 + -device
+     virtio-net-device,netdev=net0 FIRST (qbus prepends: first -device
+     -> highest transport).  libslirp-dev 4.8.0 installed; CONFIG_SLIRP
+     now #define (config-host.h).
+
+  Exit evidence (pasted):
+  - make run-linux-emmc: `smp: Brought up 1 node, 8 CPUs` at 0.107s,
+    LINUX-OK, 35 PASS / 0 FAIL, 0 invalid/unimp/guest_errors
+    (/tmp/opencode/run-linux-emmc.txt).
+  - make run-linux-stock (STOCK_SMP_DTB): `Brought up 1 node, 8 CPUs`
+    at 0.106s, `Run /init` at 51.8s (was 145s 1-CPU), LINUX-OK
+    (/tmp/opencode/run-linux-stock.txt).
+  - make regress: U-Boot prompt=1 invalid=0; EDK2 banner=2 invalid=0.
+  - Armbian desktop (run-desktop.py, loglevel=7 evidence run
+    /tmp/opencode/p16-armbian-b1-smp.txt): 8x GICv3 redistributor found
+    (0x0-0x700) at 0.00-0.09s, `Brought up 1 node, 8 CPUs` at 0.093s
+    (was 36.32s), single boot (no reboot loop), login reached, NM
+    started, network-online.target reached, 0 "Waiting for" lines.
+    EXT4 journal (damaged by prior force-kills) repaired via e2fsck
+    before this run - clean boot, no journal abort.
+  - B1 interactive verify (/tmp/opencode/p16-b1-verify-run2.txt):
+    eth0 UP 10.0.2.15/24 (SLIRP), virtio0..3 on /sys/bus/virtio/devices,
+    virtio_net driver bound to virtio3, nmcli eth0:ethernet:connected,
+    NetworkManager-wait-online inactive (completed, not stuck).
+  - make appimage: rk3588-qemu-x86_64.AppImage 34605560 bytes rebuilt;
+    smoke (APPIMAGE_EXTRACT_AND_RUN=1): BL31 NOTICE + U-Boot banner +
+    autoboot prompt reached.
+
+  Wall-clock table (kernel start -> milestone, Armbian, TCG):
+  | Milestone            | Before (1 CPU) | After (8 CPU + SLIRP) |
+  |----------------------|----------------|------------------------|
+  | smp Brought up       | 36.32s         | 0.09s                  |
+  | first kernel printk  | ~71s           | ~5s                    |
+  | login prompt         | ~180-260s      | reached (single boot)  |
+  | NM-wait-online       | 75s stuck      | inactive (done ~1s)    |
+
+  Deferred: B2 DONE 2026-10-14 (all-window IOMMU — 0 FORCE_RESET,
+  login ~90-100s), B3 attempted then REVERTED (broke pm-domain probe,
+  see perf.md B3), B4 (rng), B5 (i2c+hym8563), B6 (VOP2 dsp_hold),
+  B7 (misc), virtio-gpu DONE 2026-10-14 (./gpu-plan.md RESULT, exit
+  bar met).  Remaining list: perf.md STATUS BOARD.  Per-agent-Rule:
+  no commits made.
+
+## P17: QEMU eDP controller model (edp0 + edp1) + mainline analogix_dp link train (2026-10-15)
+
+User directive: "Let's do both edp0 and edp1" (following the revived eDP
+sub-goal).  Deliver: a real Analogix eDP QEMU device behind BOTH controller
+windows so (a) the unmodified ./rk firmware's EDP1 bring-up stays green and
+(b) the unmodified mainline Linux analogix_dp stack probes on EDP0, reads
+EDID over AUX, link-trains over DPCD, and lights a native 1920x1080 fbcon.
+
+### Model (src/rk3588-edp.c/.h, NEW; QOM sysbus, pattern rk3588-hdmi.c)
+- 0x1000 plain-RW register file replacing the "edp0"/"edp1" stub windows
+  (rk3588-stubs.c: both entries + rk_stub_edp_read() removed; edp0tx/edp1tx
+  TX-PHY stubs untouched).
+- Per-instance property "strm-valid" (rk3588.c creates both in
+  rk3588_create_display_devices, no IRQs, static HPD / SPI 163 never fired):
+    edp0 @0xfdec0000 strm-valid=true   <- Linux analogix_dp (waits for
+         SYS_CTL_3 STRM_VALID bit2 SET in is_video_stream_on)
+    edp1 @0xfded0000 strm-valid=false  <- ./rk firmware (edp_enable exits
+         only while bit2 is CLEAR; set -> "Timeout unable to turn video
+         signal on").  On edp1 every hooked read is bit-identical to the
+         old rk_stub_edp_read stub: 0x600 DET_STA=bit2, 0x608 HPD=bit6,
+         0x604 CHA_STA clear, 0x6c0 PLL_LOCK=bit4.
+- Read hooks terminate every guest poll; INT block 0x3c4-0x3d0/0x3dc is
+  W1C (analogix_dp_transfer acks RPLY_RECEIV/AUX_ERR by writing them).
+- AUX engine on AUX_CH_CTL_2 (0x7a4) write+AUX_EN: synchronous native DPCD
+  r/w + I2C-over-AUX at DDC 0x50 serving the 128-byte 1080p EDID (byte-
+  identical to rk3588-hdmi.c's verified block), fills BUF_DATA_0+, sets
+  AUX_RX_COMM=ACK / AUX_CH_STA, raises INT_STA.RPLY_RECEIV(+AUX_ERR on
+  NACK), self-clears AUX_EN.  Dormant on edp1 (firmware never writes 0x7a4).
+- DPCD offsets taken from THIS kernel's include/drm/display/drm_dp.h (NOT
+  the table from memory - first attempt used the wrong ones and cost a debug
+  round): 0x001 MAX_LINK_RATE=0x14, 0x002=0x84 (4 lanes+enhanced),
+  0x003=0 (no NO_AUX_HANDSHAKE -> full CR+EQ handshake), 0x100 LINK_BW,
+  0x101 LANE_COUNT, 0x102 TRAINING_PATTERN_SET, 0x103-0x106 lane sets,
+  status 0x202/0x203 done (0xff) while pattern programmed at 0x102,
+  adjust requests 0x206/0x207 = level 0 (returning 0xff there yields
+  "CR Max reached (0,3,3)"), 0x600 SET_POWER stored, PSR unsupported.
+- Trace events in qemu/hw/arm/trace-events (Rule #1: hw/arm/trace-events
+  added to the patch file list AND to the Makefile's regeneration hint):
+  rk3588_edp_aux / rk3588_edp_dpcd_write, enabled in scripts/p17-exit.sh and
+  run-linux-edp via -trace enable=rk3588_edp_*,file=...
+
+### Device tree + build (dts/rk3588-qemu.dts, Makefile, scripts/)
+- Source dts gains edp0 node (status="disabled" by default: clocks 512/511/
+  717 "dp"/"pclk"/"hclk", IRQ <0 163 4>, phys <&hdptxphy0> phy-names "dp",
+  resets 469/468 "dp"/"apb", rockchip,grf = <&vo1_grf>, no power-domains)
+  + vp0_out_edp0 endpoint@3 (ROCKCHIP_VOP2_EP_EDP0=3); base run-linux keeps
+  shipping the same images/rk3588-qemu.dtb with edp0 disabled.
+- Makefile: images/rk3588-qemu-edp.dtb derived via fdtput (edp0=okay,
+  hdmi0=disabled) PLUS a dtc round-trip driven by the new
+  scripts/edp-drop-hdmi-ep.py: vop2's vop2_create_crtcs() calls
+  of_graph_get_remote_node(vp0, -1) which returns the FIRST endpoint child
+  and rejects it when its remote node is status=disabled -> with the hdmi
+  endpoint first (and hdmi0 disabled in this DTB) vp0 got NO crtc ->
+  "Bogus possible_crtcs ... full crtc mask=0x0" and fbdev "Cannot find any
+  crtc or sizes".  Dropping the vop hdmi endpoint only in the DERIVED dtb
+  makes endpoint@3 the first/only child -> vp0 crtc exists; the base DTB
+  keeps both endpoints (hdmi run unaffected, verified).
+- New target run-linux-edp: run-linux clone on the derived DTB with the
+  AUX trace captured to $(LOG_DIR)/run-linux-edp-trace.log.
+
+### ./rk changes (Rule #4: minimal, hardware-real)
+1. src/rk3588/ddr.S: .incbin v1.16 -> v1.24 official rkbin blob (file was
+   already in rk/img, downloaded 2026-10-09) + ".balign 4" before shim
+   (v1.24 is 79443 bytes, odd -> the `b shim` target must be word aligned).
+   WHY: p9-exit/-bios genbook_demo.img was ALREADY broken at every commit
+   (verified by building d91c687, 120280e and the 10-14 AppImage binary:
+   all fault identically after "change to F0"), and plan.md recorded this
+   on 2026-10-09 ("P8 rc=0 claim is not reproducible now"; v1.16 post-F0
+   pass-loop "not pursued further per user decision").  Root fault: the
+   v1.16 blob takes its freq-index-8 path -> csel picks the -1 table entry
+   -> ldr [0xfe0c0000 + 0xffffffff] = 0x1fe0bffff, unmapped at 4G -> data
+   abort with VBAR=0 -> silent spin at vector 0x200.  v1.24 trains to "out"
+   in the model AND on the board (plan.md V1.24 note) and its DQ-pattern
+   clobber of address 0 is already handled by P12's spl-shadow/0xffff0000
+   resume vector.  genbook-ddr.bin + genbook_demo.img rebuilt.
+2. demo/main.c: re-enabled bmp_setup()/bmp_clear() (commented out during
+   the 2026-10-09 DDR debugging) - bmp.c draws the bg 0x4398d7 + white
+   font screen that scripts/p9-exit.sh's screendump asserts.
+
+### EXIT EVIDENCE (2026-10-15, all green; logs in logs/p17-*)
+- Gate A  scripts/p9-exit.sh  (firmware EDP1 through the new device):
+    qemu rc=0 (0 = guest PSCI shutdown), monitor rc=0
+    ... DDR v1.24 -> "change to F0: 2112MHz" -> "out" -> payload:
+    [UART] HPD status OK: 40 (0b1000000)
+    [UART] PLL is locked
+    [UART] Checking clock...
+    [UART] Waiting on STA: 0 (0b0)
+    [UART] Waiting for video to turn on... 40 (0b1000000)
+    [UART] enabled video output
+    Hello World from Payload ... Memory description map: ... Turning off...
+    screendump 1920x1080, distinct colors: 2
+      #4398d7 x2041720
+      #ffffff x31880
+    P9 OK: VOP2 scanout rendered; guest PSCI_SYSTEM_OFF exited QEMU (rc=0)
+    P9_SCRIPT_RC=0      ; qemu-p9.log empty (0 bytes)
+  Serial: logs/p17-gateA-serial.txt, screendump: logs/p17-gateA-screendump.ppm.gz
+- Gate B  scripts/p17-exit.sh  (Linux analogix_dp on EDP0, derived eDP DTB):
+    serial: "rockchip-drm display-subsystem: bound fdec0000.edp (ops
+    rockchip_dp_component_ops)", "Console: switching to colour frame buffer
+    device 240x67" (native mode from the eDP EDID), [PASS] mmap /dev/fb0,
+    [PASS] write /dev/tty0, LINUX-OK; no failure markers.
+    AUX/DPCD trace (logs/p17-gateB-trace.txt):
+      rk3588_edp_aux AUX i2c read addr=0x050 len=16 (x8 = EDID over AUX)
+      rk3588_edp_dpcd_write DPCD[0x100] <- 0x14   (LINK_BW HBR2)
+      rk3588_edp_dpcd_write DPCD[0x101] <- 0x84   (4 lanes + enhanced)
+      rk3588_edp_dpcd_write DPCD[0x102] <- 0x21   (training pattern 1 = CR)
+      rk3588_edp_dpcd_write DPCD[0x103..0x106]    (lane sets)
+      rk3588_edp_aux AUX dpcd read addr=0x202 len=6  (link status -> done)
+      rk3588_edp_dpcd_write DPCD[0x102] <- 0x22   (pattern 2 = EQ)
+    screendump 1920x1080, distinct colors: 6
+      #00ff00 x518400  #0000ff x518400  #ffffff x518400  (270*1920 exact)
+      #ff0000 x513536   (red band minus the fbcon text line)
+      #aaaaaa x994      (fbcon glyph strokes)
+      #000000 x3870
+    P17 OK: analogix_dp probed on eDP0, AUX/EDID + link training exercised,
+    fbcon at native 1920x1080, bands rendered, logs clean
+    P17_SCRIPT_RC=0     ; qemu-p17.log empty (0 bytes)
+  Script: scripts/p17-exit.sh (monitor quit; initramfs init idles, no guest
+  poweroff).  Serial: logs/p17-gateB-serial.txt,
+  screendump: logs/p17-gateB-screendump.ppm.gz
+- Regressions: make run-linux (HDMI + base dts incl. the new endpoint@3):
+  "bound fde80000.hdmi", "Console: switching ... 240x67", LINUX-OK,
+  invalid accesses 0.  make regress: U-Boot prompt "=>" invalid=0;
+  EDK2 banner=2 invalid=0.
+- Rule #8: make appimage rebuilt (34.6MB) + smoke:
+  APPIMAGE_EXTRACT_AND_RUN=1 ./rk3588-qemu-x86_64.AppImage -M rk3588 ...
+  -bios rk/genbook_demo.img -> rc=0, "enabled video output" +
+  "Memory description map:" + "Turning off...".
+- qemu.patch regenerated with the full Rule #1 list (8 files, now incl.
+  hw/arm/trace-events); no commits made (Rule #5).
+
+Follow-ups (non-blocking): scripts/p17-exit.sh asserts no failure markers, so a
+future intentional "force-hpd" experiment would need the list updated; the
+derived-DTB dtc round-trip could move to an overlay if fdt node deletion
+ever ships; edp1 Linux probe (chip data exists for 0xfded0000) deliberately
+left out of the DT.
+
+## P19: device-coverage pass on the all-devices DTB (2026-10-21)
+
+Goal (user directive): boot the unmodified Armbian 26.8.1 KDE image with a
+DTB that carries every node the kernel's vendor DT has, each node backed by a
+real model or by a stub/device that makes the driver fail fast or bind
+harmlessly - while the host-staged desktop boot keeps working.  Decision
+table rows are quoted in the matrix below; every verdict pasted is from
+`python3 scripts/run-coverage.py` (logs/p19-*).
+
+### Tooling
+- scripts/mk-all-dtb.py -> images/armbian/rk3588s-orangepi-5-all.dtb +
+  dts/rk3588s-orangepi-5-all.dts (`make all-dtb`): pristine vendor DTB, eMMC
+  enabled, cpu-idle-states stripped (TF-A CPUECTLR EL3, P13b), 4 virtio,mmio
+  nodes.  Virtio SPIs moved 92/93/94/98 -> 476/477/478/479: 92-94 are
+  gpu@fb000000's job/mmu/gpu interrupts (latent collision, visible only once
+  panthor binds) and 0x62 was taken too; 0x1dc-0x1df are free in this DTB.
+- scripts/run-coverage.py: boots the all-DTB with -display none + serial
+  root autologin, `--settle` (default 110 s) so late deferred binders are
+  final, then dumps DMESG/DEFERRED/LSMOD/DEVICES (listing last = no snapshot
+  race) and powers off (monitor-quit fallback); -d
+  unimp,guest_errors,invalid_mem -> logs/p19-qemu.log.
+- scripts/dtb-coverage.py: static matrix (145 enabled MMIO nodes; non-MMIO
+  children of cpus/i2c/spi/syscon/RAM skipped via MMIO_LO=0xfb000000) joined
+  with the guest dump; EXPECT rows carry the decision table.
+
+### New/changed model code
+- src/rk3588-spi.c/.h (NEW, QOM sysbus): DesignWare rockchip-spi PIO+IRQ with
+  an rk806 PMIC slave (256-byte reg file, 16-bit LE reg addr, cmd byte
+  bit7=r/w bits3:0=len-1).  Replaces the spi2 storage stub: the driver's PIO
+  path only completes inside its ISR, so the stub made every transfer die
+  with "SPI transfer timed out" (-ETIMEDOUT) and the PMIC never registered,
+  deferring 7 devices (gpu/panthor, saradc, SD slot, cpufreq, adc-keys,
+  ...).  SER bit0 edges frame the message (a read is TWO messages:
+  spi_write_then_read), RXFTLR writes mark transfer boundaries and clock out
+  the staged read data, IRQ = (RXFLR>RXFTLR) & IMR.RF_FULL.
+- rk3588-stubs.c:
+  * gmac MDIO_DATA (0x204) answers 0xffff -> "MDIO device at address 1 is
+    missing" + "cannot attach to PHY (error: -ENODEV)" immediately (was a
+    full MII scan on a zero ID).
+  * sram@fd600000 span (last GAP; matrix now 0 UNMAPPED).
+  * gpu stub widened 0x2000 -> 0x200000 (matches DT reg; killed "Invalid
+    write at addr 0xFB002004").
+  * media/gpu power-domain reject, ARMED not static (see below).
+- rk3588.c: spi2 device + GIC SPI 328 wiring; machine property
+  `pcie-link` (default **on** so the P10 stock-EDK2 path is bit-identical;
+  Linux audit runs pass -M rk3588,pcie-link=off = the empty slot the VM has)
+  -> APB LTSSM_STATUS (+0x300) reads 0 instead of the old fake 0x30011:
+  "rockchip-dw-pcie ... Phy link never came up" + empty bus (was a fictional
+  "Gen.0 x0 link up").
+- qemu/hw/virtio/virtio-mmio.c (qemu.patch list extended with this file):
+  accept VIRTIO_MMIO_SHM_SEL writes (guest probed SHM regions; SHM_LEN reads
+  already return -1) - was a LOG_GUEST_ERROR per boot.
+
+### Power-domain reject ("reject with pd") - design + what it proved
+`rockchip_pmu_domain_is_on()` for vdpu/rkvdec0/rkvdec1/gpu/av1 consults
++0x8290 (repair status, 1'b1=on); reporting them off makes every genpd
+power-on poll fail after 10 ms with "failed to set domain '<x>' on"
+(-ETIMEDOUT).  Static off is fatal: pm_genpd_init computes start_off=!is_on
+and pm_genpd_add_subdomain then returns -EINVAL (vdpu->av1 edge) -> the whole
+rockchip-pm-domain probe rolls back and genpd_debug_init() dereferences the
+half-registered provider -> PID1 Oops, "Attempted to kill init!" (observed,
+fixed).  So the reject is ARMED, gated by construction:
+- rk_pd_pwr_seen: set when rockchip-pm-domain writes 0x814c.. (firmware runs
+  earlier, so firmware CRU writes can never arm);
+- arming sources: (a) that domain's own power-off-pattern pwr write (probe
+  only writes npu/gpu/vcodec masks; media masks only appear post-probe, e.g.
+  genpd "Disabling unused"), (b) rga_parse_dt()'s SOFTRST writes at CRU
+  0xab4 bits 7-9 (ids 368-370, rst-rk3588.c LUT) - only rga_probe writes
+  those and it cannot probe before the provider exists; gpu arms at its own
+  need_regulator power-off (leaf domain, no subdomain edge - safe).
+- Verified by trace: armed went 0x2 (gpu) -> 0x982 (+rkvdec0/rkvdec1/av1)
+  -> 0xb82 (+vdpu), and 0xab4's rga write landed while already armed;
+  "failed to set domain 'gpu' on, val=0" fires whenever something resumes
+  the domain (e.g. Plasma/GDM touching the GPU at runtime).
+- **Structural limit found**: the booted 6.18-rockchip64 drivers (rga,
+  hantro, panthor, rkvdec) do not call pm_runtime_resume_and_get inside
+  probe - they bind first, and the pd reject bites at *first use* instead.
+  So the table's literal "probe abort -ENODEV" is delivered for the rows
+  where the driver does power on (none of the media ones on this kernel),
+  while gpu/vdpu/rkvdec/av1 are dead the moment anything powers them on.
+
+### Decision-table matrix (evidence from logs/p19-*, final run)
+| row | verdict | evidence |
+|---|---|---|
+| sfc | bind-harmlessly rejected | UNBOUND, pinctrl -EINVAL fail-fast |
+| dw-wdt / tsadc / saradc / sd / i2c / spi / phy | bind | bound=dw_wdt / rockchip-thermal / rockchip-saradc / dwmmc_rockchip / rk3x-i2c / rockchip-spi (+rk8xx-spi, rk808-regulator, rk805-pwrkey) / usb2phy |
+| npu x3 | inert | no driver; never probes |
+| panthor | binds (6.18 panthor ignores GPU_ID=0 at probe); gpu domain armed -> every power-on -ETIMEDOUT ("failed to set domain 'gpu' on") | bound=panthor, 1 x gpu-on error |
+| rga / vpu121 / vepu121(x1 main) | bind, dead at first use (vdpu armed) | bound + /dev/video0-2 |
+| vepu121 x3 satellites | rejected | hantro "missing multi-core support, ignoring this instance" (-ENODEV) |
+| vdec x2 | UNBOUND (no probe error, not deferred) | rows UNBOUND; module loaded |
+| av1 | racy: bound in one run, unbound in the final run | hantro "registered ...av1-vpu-dec" once |
+| gmac no PHY | -ENODEV, no MII scan retry | "cannot attach to PHY (error: -ENODEV)" same-second |
+| pcie link-down | "Phy link never came up" + empty bus | -M pcie-link=off |
+| dwc3 | fast reject (not a root-hub bind) | "this is not a DesignWare USB3 DRD Core" |
+| ehci x2 / ohci@fc8c0000 | FAIL row: probe -110/-1 (fast, ~90 ms) instead of root-hub bind | probe-with-driver lines |
+| ohci@fc840000 + usb-kbd | bind (our sysbus-ohci model) | bound=usb |
+Matrix: 145 enabled MMIO nodes = 33 model + 112 stub + **0 UNMAPPED**,
+57 bound / 85 unbound / 3 absent; devices_deferred = 4 (npu x2 on the
+fusb302-supplier link, cpufreq-dt, typec tcpm); qemu -d log = the benign
+"SD card voltage not supported" echo only; no panic/rollback (0 in dump).
+
+### Exit evidence (2026-10-21)
+- `python3 scripts/run-coverage.py --qemu build/qemu/qemu-system-aarch64`:
+  rc=0, guest dump 101417 B, qemu rc=0, -d log 1 line/0 suspicious,
+  logs/p19-{guest,coverage,qemu}.*.
+- `scripts/p9-exit.sh` -> P9_SCRIPT_RC=0 (scanout #4398d7, PSCI_SYSTEM_OFF rc=0).
+- `scripts/p17-exit.sh` -> P17_SCRIPT_RC=0 (analogix_dp train, bands, clean logs).
+- `make all-dtb` (4 virtio nodes at 0x1dc..) + `make qemu` green.
+- Rule #8: `make appimage` rebuilt (34.6 MB); smoke = desktop run on the
+  AppImage + AppImage demo run (below).
+Follow-ups (open): ehci/ohci root-hub models for the two USB rows; media +
+panthor are bind-but-dead rather than probe-rejected on this kernel (see
+matrix); cpufreq-dt/typec deferred rows; the repeated
+"failed to get mem status 'rkvdec0/1|av1', target_on=0" lines during desktop
+runtime (armed domains being retried by genpd - cosmetic but noisy).
+- Desktop regression smoke (driven, on the AppImage): run-desktop + serial
+  commands at +7.5 min pasted the full session:
+  `sddm-helper ... startplasma-wayland --user opi --autologin`,
+  `/usr/bin/startplasma-wayland`, `/usr/bin/kwin_wayland --socket wayland-0`,
+  `/usr/bin/Xwayland :0`, `/usr/bin/plasmashell --no-respawn` (+ its
+  kioworker) - Plasma Wayland up ~4-5 min after boot with the all-DTB,
+  pcie-link=off, virtio SPIs 476-479 and the spi2/PD changes in place.
+  (Two earlier *passive* watches saw banner/systemd/`sddm.service Started`/
+  autologin shell with 0 oops/invalid lines but can never see plasmashell:
+  it never prints to ttyS2 - p15's evidence was also a typed `ps aux`.)
+- AppImage artifact smoke (Rule #8): APPIMAGE_EXTRACT_AND_RUN=1 ./rk3588-
+  qemu-x86_64.AppImage -M rk3588 -bios rk/genbook_demo.img ->
+  **self-exit rc=0**, 3 marker lines (payload banner / Memory description
+  map / Turning off), 0 guest_errors in the QEMU log.
+
+## P19 USB row: all five host controllers bind with empty root hubs (2026-10-21)
+
+Decision-table row "dwc3/xhci/ehci -> bind harmlessly (root hubs, 0 ports)":
+usbcore rejects literal 0-port hubs ("hub doesn't have any ports!"
+-ENODEV, hub.c:1506), so "0 ports" = **one permanently empty port per root
+hub** - nothing ever attaches (PORTSC stays 0) and enumeration of the root
+hub is software-side, so no host-side IRQ wiring is needed.
+
+- EHCI x2 (usb@fc800000/fc880000): new per-instance read hook (read_hook2,
+  RkStub context variant) - hc_capbase = EHCI 1.0 + CAPLENGTH 0x10,
+  HCSPARAMS N_PORTS=1, USBCMD.HCRESET self-clears, and USBSTS.HCHalted =
+  !USBCMD.RUN.  The last one is what the storage stub got wrong: usb_add_hcd
+  -> ehci_init -> ehci_halt() spins for STS_HALT **reading 1** (2 ms), so
+  plain zeros fail with "can't setup: -110".
+- OHCI host1 (usb@fc8c0000): second real `sysbus-ohci` (SPI 219 = DT cell
+  0xdb) + stub span removed (stubs shadow devices, P11 lesson); binds with
+  its own empty root hub.  Host0 keeps its keyboard.
+- dwc3 x2 (usb@fc000000 otg, usb@fcd00000 host): one hook covers both
+  register files of the 4 MB window - xHCI at [0,0x7fff] (child xhci-hcd
+  resource: CAPLENGTH 0x20 + HCI 1.0, HCS1 = 2 ports/1 interrupter/32
+  slots, DBOFF 0x2000, RTSOFF 0x3000, USBCMD.CMD_RESET self-clears,
+  USBSTS.Halted = **bit 0** (xHCI layout!) = !RUN, page_size 1) and dwc3
+  Globals from 0xc100 (GSNPSID 0x5533330a = ip 0x5533 rev 3.30A so
+  core_is_valid() passes; DCTL.CSFTRST bit30 self-clears; power-on
+  GHWPARAMS0=DRD, GHWPARAMS3 NUM_EPS=16).  The first xhci attempt died
+  with "No Extended Capability registers, unable to set up roothub"
+  (-ENODEV from xhci-mem.c), so the model also publishes HCCPARAMS.xECP
+  -> a PROTOCOL-capability chain at 0x40/0x60 (id 2, USB2 major=2 offset 2
+  + SuperSpeed major=3 offset 1, counts summing to HCS1 ports as the
+  classifier requires).  usb@fc000000 (dr_mode=otg + usb-role-switch,
+  no typec partner in the VM) binds and idles in device mode;
+  usb@fcd00000 (dr_mode=host) spawns the xhci-hcd child with **both** root
+  hubs up ("Host supports USB 3.0 SuperSpeed", usb 1d6b:0002 + 1d6b:0003).
+
+### Exit evidence (2026-10-21)
+- `python3 scripts/run-coverage.py --settle 50`: rc=0, **0 probe failures
+  of any driver**, devices_deferred empty, 145 nodes = 34 model + 111 stub
+  + **0 UNMAPPED**, 61 bound, qemu -d log clean (only the SD-voltage echo),
+  logs/p19-coverage.txt rows: usb@fc000000/fc800000/fc840000/fc880000/
+  fc8c0000/fcd00000 all bound; root hubs enumerated (xhci usb1/usb6,
+  ehci usb3/usb4, ohci buses 2/3/5).
+- Follow-ups: none open on USB; ehci/ohci/dwc3 DT interrupts stay unwired
+  host-side (root-hub work is software-polled; no device can interrupt).
+- Report join fix: a root-hub interface inherits the controller's of_node,
+  so load_guest now lets the platform entry win for a repeated dt path -
+  rows read `bound=dwc3 / ehci-platform / ohci-platform` (all six).
+- Rule #8 after these src changes: `make appimage` rebuilt (34.6 MB) ->
+  AppImage demo **self-exit rc=0** (markers 2, guest_errors 0);
+  `scripts/p9-exit.sh` rc=0 and `scripts/p17-exit.sh` rc=0 confirm the firmware/Linux
+  paths are unaffected by the new ehci/dwc3 window hooks (GSNPSID etc.
+  now answer non-zero to anything that peeks); no commits (Rule #5).
+
+## P19 status: DONE with deferrals (declared 2026-10-21)
+
+- Exit evidence (all green): `python3 scripts/run-coverage.py` rc=0 with
+  **0 probe failures / 0 deferred devices / 0 UNMAPPED** (145 enabled MMIO
+  nodes = 34 model + 111 stub, 61 bound, clean `-d` log); `make all-dtb`;
+  `make qemu`; `make appimage` + AppImage demo **self-exit rc=0**;
+  `scripts/p9-exit.sh` rc=0; `scripts/p17-exit.sh` rc=0; desktop on the AppImage
+  verified through `plasmashell` + `kwin_wayland` + `Xwayland` via a typed
+  `ps aux` (the serial console never prints those markers).
+- Deferral (user decision 2026-10-21: "defer media/gpu"): rga, hantro
+  (vpu121/vepu121/av1), vdec and panthor rows are **bind-but-dead** — the
+  armed power-domain reject fails every power-on with -ETIMEDOUT at first
+  use and no firmware is ever requested, but the drivers' probe does not
+  power the domain on this 6.18-rockchip64 kernel, so /dev/videoN and the
+  DRM node exist.  Revisit options: accept / force codec probe failure via
+  their iommu attach (rga + GPU have no iommu, so they'd stay bind-but-dead)
+  / `status = "disabled"` those nodes in the generated DTB.
+- Non-blocking follow-ups: typec fusb302 ("cannot register tcpm port" — also
+  the missing role partner for usb@fc000000's OTG mode); sound (es8328 ASoC
+  read errors + 2x asoc-simple-card parse errors); cpufreq-dt defer with no
+  reason; vdec corner (rockchip_vdec loads, nodes never bind, no error);
+  log noise: B3-family "failed to set domain 'X' off" (~16/boot) and the
+  armed-domain "failed to get mem status ... target_on=0" retries during
+  desktop runtime; the SD-voltage echo (now the only `-d` log line).
+- Next per plan/AGENTS: **P10** (unmodified stock-image chain) unless
+  redirected; media/GPU revisit whenever the user calls it.
+
+## Display console order + naming (2026-10-21, post-P19)
+
+- `src/rk3588-display.c` rewritten as a machine-internal sysbus device
+  `TYPE_RK3588_DISPLAY` ("rk3588-display", qdev id **"hdmi"**,
+  user_creatable=false).  Its console is created from a
+  `qemu_add_machine_init_done_notifier()` callback —
+  `qdev_machine_creation_done()` runs in vl.c *after* `-device` realize —
+  so: `vgpu=on` → console 0 = virtio-gpu head (window/VNC default view,
+  GTK first tab), console 1 = VOP2/HDMI (QOM `/backend/console[1]`);
+  `vgpu` off → HDMI remains index 0, i.e. the plain `screendump` used by
+  p9/p17 exits is unchanged.  HDMI stays addressable at any index via
+  `screendump <file> hdmi` (`qdev_find_recursive` by id; programmatic id
+  assignment follows the hw/arm/npcm8xx.c precedent).
+- `gfx_update` gained a pre-notifier guard (`s->con == NULL`).
+- "Garbage pixels" explained: QEMU seeds every new graphic console with a
+  "Guest has not initialized the display (yet)." placeholder (console.c
+  `qemu_create_placeholder_surface`), so pre-VOP2 dumps are that message;
+  after a guest DRM modeset the surface maps the guest framebuffer
+  verbatim, so uninitialised guest RAM *looks* noisy until fbcon
+  draws — correct emulation, not a model bug.
+
+## screendump-by-device crash, default-view flip, patch repair (2026-10-21)
+
+Follow-up to "Display console order + naming" above; all gates green:
+
+- **Upstream latent bug found & fixed in qemu/ui/console.c**:
+  `qemu_console_lookup_by_device()` pulled the "device" link from EVERY
+  console with `&error_abort`; `qemu-fixed-text-console` (created by
+  `-serial`) has no such property -> `object_property_find_err()` abort ->
+  SIGABRT (rc=134, "Property 'qemu-fixed-text-console.device' not found" +
+  "Unexpected error in object_property_find_err() object.c:1454") on
+  `screendump <f> <device>`.  Guard added: skip non-graphic consoles
+  (same style as qemu_graphic_console_lookup_unused(); "device" is a
+  class-declared property of graphic consoles only, console.c:534).
+- **RULE #1 REPAIR**: `git -C qemu status` showed hw/usb/hcd-ohci.c
+  modified but ABSENT from qemu.patch's file list — the P19 HCR
+  self-clearing hunk (makes ohci-platform bind) had been silently dropped
+  by a partial regeneration, exactly the failure mode Rule #1 warns about.
+  qemu.patch regenerated with the FULL list, now **11 files** (adds
+  hw/usb/hcd-ohci.c + ui/console.c); coverage check: status == patch list,
+  zero uncovered.
+- **scripts/p9-exit.sh / scripts/p17-exit.sh now use `screendump <f> hdmi`**: measured in
+  the no-vgpu config, `-serial` creates a text console that owns index 0
+  (plain dump = 640x384 serial framebuffer), so the old plain dumps would
+  have broken; the device-id form is index-proof.  Both exits PASS (p9:
+  1920x1080, bg #4398d7 + white; p17: colour bands + fbcon 1920x1080,
+  rc=0).
+- **Gate matrix (all green)**: bare-QEMU isolation (vgpu=on:
+  console[0].device = /machine/peripheral/vgpu = default view, hdmi =
+  console[2]; no-vgpu: hdmi = console[1]; plain/hdmi/vgpu dumps all
+  succeed, QEMU stays alive); p9 rc=0; p17 rc=0; `make appimage` (first
+  attempt hit a transient sfs_mksquashfs error, retry Success) + AppImage
+   demo self-exit rc=0 / markers 1 / guest_errors 0 on the FRESH artifact.
+
+## Virtio transport DTB consistency (P19 follow-up, 2026-10-21)
+
+- P19 moved the four virtio-mmio transports (src/rk3588.c) from
+  `0xfb000000+i*0x1000` to `0xfb200000+i*0x1000`, and SPIs from
+  {92,93,94,98} to {476,477,478,479}, reserving the Mali window for
+  the 2 MB GPU storage stub. `make all-dtb` reflects the new layout.
+- A stale test DTB still described the old addresses and IRQs, causing
+  virtio probes to hit the GPU stub instead. Updating its reg and interrupt
+  properties with fdtput restored device discovery; dtc round-trip and
+  address/IRQ collision checks passed. Node names do not determine the
+  device type: the guest reads it from the transport.
+- Without SET_SCANOUT, virtio-gpu shows "Display output is not active."
+  (`qemu_console_set_surface(NULL)` in ui/console.c).
+- Corrected stale SPI labels in src/rk3588.c's transport comment block.
+
+## P20 — Unmodified Armbian disk boot (DONE, 2026-10-26)
+
+Target only `Armbian_26.8.1_Orangepi5_resolute_current_6.18.43_kde-plasma_desktop.img`;
+SHA256 `7c677b2b1ab2dbc7692623a4b7b5c8dcda01fea9483af700cb234d2d67496b7e`.
+The image's `/etc/hostname` is `orangepi5` (not `orangepi-5`).  Acceptance
+requires its own disk firmware, U-Boot autoboot, kernel/initrd/DTB and serial
+login, zero serial input, no host-staged loaders or guest-image edits, clean
+QEMU diagnostic log, eight Linux CPUs online, and unchanged first 16 MiB.
+Do not count diagnostic images, debugger-injected timer kicks, or partial
+`--until` successes as acceptance.  The full exit gate passed below.
+
+Harness: `scripts/run-opi5-raw.py --qemu build/qemu/qemu-system-aarch64 --fresh`.
+It uses a qcow2 overlay, `/dev/null` stdin, a separate monitor, the exact
+`orangepi5 login:` marker, before/after backing-image SHA256 and logical
+overlay/base comparison of the first 16 MiB.  Dirty diagnostic logs fail a
+login run.  Custom image arguments are explicitly labelled diagnostic.
+At login, `scripts/check-opi5-cpus.gdb` reads the stock kernel's online
+mask through its EL2 page tables using debugger physical-memory mode;
+it neither writes guest registers/memory nor sends serial input.  Its
+offsets are pinned to this image's own System.map, not the local 7.2.9
+kernel.  This proof requires `gdb-multiarch`.
+
+Confirmed progress and diagnoses this session:
+
+- The disk's DDR/SPL/TF-A/U-Boot/boot.scr chain reaches Linux automatically.
+  Earlier additions include the vendor EL3 implementation-register RAZ/WI
+  definitions in `qemu.patch`, KEYLADDER_S mapping, and the DW-MSHC IRQ output.
+- Exact kernel BTF and System.map were extracted read-only from `/boot`.
+  Task offsets and saved frame pointers identified PID1 waiting in
+  `async_synchronize_full()`, with SD probe asleep in regulator voltage
+  settling.  This was not initially a CMD_DONE interrupt wait.
+- Linux's `local-timer-stop` idle state uses **rk_timer as its broadcast
+  clock-event**.  `src/rk3588-timer.c` formerly raised expiry only when
+  CURRENT_VALUE was read, so clock-event waits never woke.  It now schedules
+  asynchronous QEMUTimer expiries, periodic reload and W1C IRQ clearing.
+  An experiment preserving CNTHP across CPU reset was discarded: local
+  architectural timers are deliberately shut down for this idle state.
+- The provisional unconditional 2 ms PMU wake was replaced by a pending-
+  interrupt wake detector.  A small local QEMU hook gates CPU power at the
+  next EL3 WFI, rather than allowing an IRQ to fall through into TF-A's
+  unexpected-wake path.  PMU wake must consult redistributor pending state,
+  not CPU IRQ output: TF-A disables its CPU interface before WFI.  Actual
+  evidence was SGI1 pending (`GICR_ISPENDR0=2`) with the core still parked.
+  The wake detector currently samples every 2 ms of virtual time; this is
+  not a complete PMU implementation and migration is not supported.
+- A fresh pristine-backed run with those changes reached **Run /init**.
+  Read-only GDB extraction of the stock kernel's printk ring confirmed
+  `smp: Brought up 1 node, 8 CPUs` and `__cpu_online_mask=0xff`; PID1 was
+  userspace `init` waiting for a child.  No debugger register/memory writes
+  were used in that run.  Serial was quiet because stock loglevel is 1;
+  QEMU's diagnostic log was zero bytes.
+- The subsequent SD rescan blocked in `mmc_go_idle()`.  Runtime registers
+  showed RINTSTS=4 but INTMASK=1: CTRL engine reset had incorrectly called
+  full QOM reset and erased INTMASK.  Software reset now preserves the
+  register bank, resetting just transfer state.  Linux also touches
+  CDTHRCTL (+0x100): register storage now extends through ENABLE_SHIFT
+  (+0x110).  HCON now advertises the implemented 32-bit FIFO instead of
+  advertising 16-bit accesses while consuming four bytes per read.
+  The diagnostic boot then reported `mmc0: new high speed SDHC card`,
+  `mmcblk0: p1`, mounted the stock root UUID as ext4, and started systemd.
+  The pristine-backed zero-input run then reached
+  `orangepi5 login: root (automatic login)` at 426 s.  Its base SHA256
+  and logical first 16 MiB were unchanged; QEMU diagnostics were 0 bytes.
+  Read-only inspection during that same run proved online mask 0xff.
+  A fresh `scripts/p20-exit.sh` repeat integrated the CPU proof into the harness
+  rather than collecting it as a separate manual check.
+  That first repeat reached login at 368 s with all integrity/log checks
+  passing, but returned rc=1 because the HMP helper closed before the
+  long gdbserver command was processed.  The helper now drains the echo
+  and waits for the next monitor prompt.  A regression experiment proved
+  the long socket command completes and GDB connects (and correctly
+  rejects an unbooted guest as CPU evidence).  The next formal gate passed.
+- UART TX loopback now feeds the RX FIFO instead of leaking the Linux FIFO
+  autoconfiguration byte ramp to the host.  Machine-local GIC-600 GICR_PWRR
+  windows at each redistributor's +0x24 model always-powered RAZ/WI state,
+  removing the vendor firmware's reserved-offset diagnostic noise without
+  changing the generic GIC model.
+
+Regression evidence (not P20 acceptance):
+
+```
+$ python3 scripts/test-rk-boot-devices.py
+PASS: asynchronous one-shot, W1C, periodic reload, disable
+PASS: SD software reset preserves config; CMD_DONE IRQ and W1C
+$ scripts/p9-exit.sh
+P9 OK: VOP2 scanout rendered; guest PSCI_SYSTEM_OFF exited QEMU (rc=0)
+P9_SCRIPT_RC=0
+$ scripts/p17-exit.sh
+P17 OK: analogix_dp probed on eDP0, AUX/EDID + link training exercised, fbcon at native 1920x1080, bands rendered, logs clean
+P17_SCRIPT_RC=0
+```
+
+Final-code follow-up: P9/P17 passed again after the SD fixes; `make
+appimage` succeeded and its demo self-exited rc=0 after `Turning off...`.
+The actual `scripts/run-desktop.py` flow also reached serial login using
+the rebuilt AppImage and a separate scratch raw copy (then Ctrl-C
+shutdown, runner rc=0).  The bare build binary's VNC initially failed
+because its installed datadir lacks the en-us keymap; the AppImage has
+the bundled pc-bios/keymaps and works.  No desktop-runner source changes
+were needed.  The new harness's logical boot-region check was tested
+against both an unchanged overlay (pass) and an overlay-only sector-zero
+write (correctly rejected).  No `./rk` or stock-image changes were needed.
+
+### P20 exit evidence
+
+`scripts/p20-exit.sh` returned **rc=0**.  Actual output (full log:
+`/tmp/opencode/p20-exit-final.log`):
+
+```
+orangepi5 login: root (automatic login)
+[p20] MARKER login at 362s: 'orangepi5 login:'
+[p20] P20_CPU_PROOF: Linux __cpu_online_mask=0xff (8 CPUs)
+[p20] VERDICT: OK to 'login' in 362s
+[p20] markers seen: ['rom', 'spl', 'uboot', 'script', 'kernel', 'login']
+[p20] pristine image sha256 after run 7c677b2b1ab2dbc7692623a4b7b5c8dcda01fea9483af700cb234d2d67496b7e
+[p20] pristine image unchanged
+[p20] logical first 16 MiB unchanged
+[p20] qemu -d log: /tmp/opencode/p20-qemu.log (0 bytes)
+P20 OK: stock disk autoboot, serial login, 8 Linux CPUs, no serial input, unchanged boot region, clean diagnostics
+```
+
+This claims autonomous disk-to-serial-login boot, **not a native GPU/KDE
+desktop**.  The stock DT still produces guest-side power-domain timeout
+messages, no-PHY errors, and some Armbian service/journal errors; these are
+not QEMU `-d` MMIO diagnostics and did not prevent login.  The media/GPU
+deferrals remain in force.  No additional network/virtio workaround was
+added to this boot path.  The PMU wake detector's 2 ms sampling is still a
+model limitation, not an implementation of full hardware power management.
+
+Post-milestone packaging was repeated after the passing exit command:
+`make appimage` rc=0; AppImage demo smoke rc=0, last serial line
+`Turning off...` (`/tmp/opencode/p20-post-milestone-package.log` and
+`/tmp/opencode/p20-post-milestone-smoke.log`).  No QEMU processes were left
+running at handoff.  Changes remain uncommitted.
+
+## Experimental PCIe virtio GPU (in progress)
+
+The unmodified P20 Armbian disk can discover a virtio PCI GPU without a
+replacement DTB.  `-M rk3588,pcie-experimental=on` connects the QEMU
+DesignWare PCIe host at the stock DT's `pcie@fe190000`, the SMMUv3 at
+`0xfc900000`, and both GIC ITS blocks.  Attach the GPU using
+`-device virtio-gpu-pci,id=vgpu,bus=dw-pcie,addr=0`.  Use a scratch
+copy-on-write SD disk or QEMU `-snapshot`; do not let the guest write the
+pristine image.  The default machine remains unchanged.
+
+The DesignWare model required fixes in qemu.patch for 64-bit iATU base/limit
+calculation, the transaction-type field in control register 1, and outbound
+windows overlapping existing SoC stubs.  Root reset now clears programmed
+iATU windows and restores the default inbound mapping; a QTest caught the old
+outbound mapping surviving reset.  `make test-pcie-config` exercises
+configuration transactions, a real 64-bit GPU BAR read/write, SMMU ID and
+the opt-in ITS registers.  `make test-pcie-gpu` boots a fresh COW overlay,
+checks a GPU MSI-X counter increases across a framebuffer write, and requires
+an entirely red 640x480 QMP screendump with an empty QEMU diagnostic log.
+Observed: `PASS: GPU MSI-X 7112 -> 7113; 640x480 red scanout`; Linux
+enumerated 0004:41:00.0 and exposed card0 and renderD128.  This proves the
+tested 2D virtio-GPU path, not native Mali or accelerated 3D, nor a KDE
+desktop.  INTx, other PCI devices, migration, reset and 64-bit windows crossing
+a 4 GiB boundary are not validated; the machine option remains experimental.
+The optional `test-rk-pcie-gpu.py --reboot` reached Linux's `reboot:
+Restarting system` but did not reach a second kernel boot within 1800 seconds.
+A no-PCIe control run also reached `reboot: Restarting system` without a second
+kernel boot (1400-second timeout), so reboot is a pre-existing machine-path
+limitation, not established as a PCIe regression.
+The current host build lacks virglrenderer.  Per user direction, AppImage
+rebuilding is deferred while this work proceeds.
+
+### HDMI disconnect experiment (2026-10-29)
+
+`-M rk3588,hdmi-connected=off` sets the static HDMI0 HPD level low; the
+default remains connected, independent of PCIe and virtio devices. This does
+not disable VOP2 or modify the guest DTB. On a fresh raw copy of the stock
+Armbian image, with `pcie-experimental=on` and a PCI virtio GPU, Linux reported
+Virtual-1 connected and HDMI-A-1 disconnected, while rockchip DRM still bound.
+Plasma and a serial-launched Konsole ran; the latter's shell created a marker
+and appeared in a 1280x720 virtio screenshot. The background remained black
+with no visible panel, so disconnecting HDMI alone did not resolve the desktop
+issue. Keyboard/mouse input was not tested. The guest continued reporting
+sdmmc power-domain failures and KWin logged software-rendering/DRM errors; the
+QEMU diagnostic log was empty. Evidence: `/tmp/opencode/hdmi-off-serial.log`
+and `/tmp/opencode/hdmi-off-vgpu.png`. AppImage rebuilt; its default demo
+self-exited rc=0, and `scripts/p9-exit.sh` passed with the default HDMI setting.
+
+Follow-up: sampled a fresh boot's blocked plasmashell stack. Multiple samples
+show `rpm_resume -> __mmc_claim_host -> mmc_get_card -> mmc_mq_queue_rq`;
+genpd summary showed sdmmc on and the MMC device suspending/suspended, while
+the sdmmc power-off timeouts repeated. This confirms an MMC runtime-PM wait,
+not that every desktop problem is caused by it. A temporary SDMMC-only PMU
+experiment tracked power-control bit 13 at 0x8150 and repair bit 26 at
+0x8290, with memory status following at 0x81fc bit 5. It removed those timeout
+messages and reached serial login at 284 seconds, but did not reach the
+Plasma/Konsole checkpoint within 2100 seconds. It was removed; no successful
+desktop or performance claim. Logs: `/tmp/opencode/pm-investigate-serial.log`
+and `/tmp/opencode/pm-fix-serial.log`. Rebuilt AppImage after removal; default
+demo self-exited rc=0. Further work must trace SD resume and the controller's
+state across the full off/on cycle before attempting another change.
+
+Repeat of the same temporary PMU experiment using the direct build and a fresh
+raw copy: serial login at 247 s, `plasmashell` running by the 368 s diagnostic
+checkpoint, MMC runtime status active with ~19 s accumulated suspended time,
+and a 4 KiB direct block-device read returned rc=0. Thus the preceding
+35-minute desktop checkpoint failure did not reproduce; the runs are not a
+controlled AppImage/direct-build comparison, and neither establishes reliable
+transitions or a desktop fix. The proposed PMU change was again removed and
+the AppImage rebuilt and demo smoke-tested rc=0. Trace:
+`/tmp/opencode/pm-trace-serial.log`. The active/suspended counters do not
+prove the full domain transition sequence; a repeatable controlled test is
+still needed.
+
+### PCI virtio GPU virgl probe
+
+Installed `libvirglrenderer-dev`, `libegl1-mesa-dev`, `libgbm-dev`,
+`mesa-utils`, and `mesa-vulkan-drivers`; reconfigured build/qemu with
+`-Dvirglrenderer=enabled`, rebuilt the AppImage and confirmed its default demo
+self-exits rc=0. The image bundles libvirglrenderer and exposes
+`virtio-gpu-gl-pci`. On the host `/dev/dri/renderD128` selects an AMD Radeon
+RX 7800 XT. Fresh disposable raw Armbian boot with
+`-M rk3588,pcie-experimental=on,hdmi-connected=off`,
+`-device virtio-gpu-gl-pci,id=vgpu,bus=dw-pcie,addr=0,xres=1280,yres=720`,
+and `-display egl-headless,rendernode=/dev/dri/renderD128` reported kernel
+`+virgl`. Guest `eglinfo -B` as the Plasma user reported
+`virgl (AMD Radeon RX 7800 XT ...)` for Wayland, GBM and surfaceless EGL,
+OpenGL 4.3. This verifies a hardware-backed guest EGL context, not that KWin
+compositing or every application uses it. XWayland `glxinfo -B` reported
+llvmpipe, KWin logged DRM/GL fallback messages, and QMP screendump returned
+`no surface` with this GL backend; a visible accelerated desktop and input
+remain unverified. QEMU diagnostic log empty. Evidence:
+`/tmp/opencode/virgl-probe-serial.log` and `/tmp/opencode/virgl-probe-qemu.log`.
+Adding `-vnc 127.0.0.1:77` to the EGL-headless run allowed a VNC capture:
+`/tmp/opencode/virgl-vnc.png` shows a serial-launched Konsole on a black
+background. It does not establish accelerated KWin or a working panel.
+`scripts/run-virgl-desktop.py` launches the AppImage with this PCI GPU and
+input setup, a disposable raw disk and loopback-only VNC; a 150-second launcher
+smoke reached `Starting kernel` and was interrupted. Full desktop behavior
+through that launcher has not been verified.
+
+#### Desktop slowdown and guest configuration follow-up
+
+On the user's GTK/Wayland host, Konsole took 1–2 minutes to appear with
+virgl, compared with seconds in their recollection of llvmpipe. KDE reported
+llvmpipe and the cursor was invisible. The guest detected PCI virtio GPU on
+`card0` with `+virgl`; Rockchip display-subsystem was `card1`. KWin's
+environment contained `KWIN_DRM_DEVICES=/dev/dri/card0` and
+`MESA_LOADER_DRIVER_OVERRIDE=zink`. Both `/etc/environment.d/99-vgpu.conf`
+and `/home/opi/.config/environment.d/99-vgpu.conf` set that override and the
+KWin device. Journal messages reported Zink failing to choose a physical
+device and XWayland disabling glamor and falling back to software; these do
+not independently prove KWin's compositor renderer. The Zink override is a
+strong suspect, not a confirmed root cause. The user was instructed to
+comment it out in both files (preserving `.bak` backups and the KWin device)
+and reboot; the outcome and cursor behavior after reboot remain pending.
+This is a persistent change to the user's live image, not to the emulator.
+
+In fresh-copy AppImage diagnostics, Konsole and KWin were caught blocked in
+MMC runtime resume alongside repeated `sdmmc` power-off timeouts under both
+virgl and software GPU modes. In one separate virgl run, setting the MMC
+card's `power/control` to `on` before desktop startup coincided with no
+timeouts during sampling and a Konsole shell marker 25 guest-clock seconds
+after launch; neither host-wall launch time nor window visibility was
+measured. Logs: `/tmp/opencode/slowdiag-{virgl,software,pmon}-serial.log`.
+On the user's live session, setting only the card to `on` did *not* stop
+the timeouts; also setting `/sys/bus/platform/devices/fe2c0000.mmc/power/control`
+to `on` left the controller active and appeared to stop the messages. The
+user reported Konsole was slightly faster, but no faster than their previous
+llvmpipe experience. These runtime settings reset at reboot. They are a
+diagnostic workaround, not a validated device-model fix or a controlled
+graphics performance comparison.
+
+SDMMC PM follow-up: a temporary SD-only experiment tracked domain power at
+`0x8150`/repair status `0x8290` and independently tracked memory reset via
+`0x81a4`/memory status `0x81fc` (Linux may reset powered memory on resume).
+Focused register tests passed and a disposable raw-copy AppImage virgl boot
+reached serial login at 202 s host wall, versus 490 s for the earlier virgl
+run; the diagnostic saw no SD timeout messages and Konsole was not sampled
+blocked in MMC. These are single runs, not a controlled performance claim.
+An additional fresh-copy run reached login at 169 s, but a deliberate
+controller runtime-PM test reported `runtime_status=error` throughout; three
+4 KiB reads succeeded, but no successful suspend/resume cycle was established.
+The experiment is therefore NOT a fix: it was removed, and the AppImage was
+rebuilt and demo smoke-tested rc=0. Guest log:
+`/tmp/opencode/slowdiag-cycle-serial.log`; earlier experimental desktop log:
+`/tmp/opencode/slowdiag-sdfix-serial.log`. Next determine the runtime-PM
+error and trace actual controller and domain callbacks before any retry;
+absence of timeout messages and successful cached reads are insufficient.
+
+Fast SD runtime-PM harness: `python3 scripts/test-sd-runtime-pm.py` reuses
+`images/initramfs.bin`, with a temporary `/init` overlay, the extracted
+Armbian 6.18.43 kernel and `images/armbian/rk3588s-orangepi-5-armbian.dtb`.
+It stages them through the existing TF-A/U-Boot path, attaches a disposable
+64 MiB raw SD, writes a random block, and requires three controller
+suspend/resume cycles with direct reads and matching data. It also rejects
+SDMMC domain timeout messages, because the unmodified model can report a
+suspended controller even though the domain power-off has failed. Requires
+host `cpio`; no existing initramfs or disk image is overwritten. The current
+baseline reaches the shell at about 15 s host wall and correctly fails the
+domain-timeout check after the cycles (about 100 s total); it is not evidence
+of a fixed power domain. Log: `/tmp/opencode/sdpm-minimal-cycle2.log`.
+
+SDMMC fix follow-up: the fast harness exposed the prior failure as
+`failed to get chain status 'sdmmc', target_on=1, val=0`: SDMMC's memory
+chain is bit 5 of the *second* chain-status word (`0x81f4`), not `0x81f0`.
+`src/rk3588-stubs.c` now tracks the SDMMC domain control/repair status and
+its independent memory reset control/status; `0x81f4` reports the SDMMC
+chain up without altering other bits. State resets on machine reset. The
+AppImage test `python3 scripts/test-sd-runtime-pm.py --qemu
+./rk3588-qemu-x86_64.AppImage --timeout 180` passed three observed
+suspend/resume cycles with direct readback and no SDMMC domain timeouts,
+host wall 67.7 s (`/tmp/opencode/sdpm-appimage-cycle.log`). Focused PMU
+register/SD controller regression `scripts/test-rk-boot-devices.py` passed;
+AppImage demo self-exited rc=0. A disposable-copy virgl desktop diagnostic
+reached serial login at 290 s wall and completed at 526 s, observed a Konsole
+shell marker, zero SDMMC power/chain/memory errors, and an empty QEMU
+diagnostic log (`/tmp/opencode/slowdiag-sdfinal-serial.log`). This was a
+serial-launched Konsole, not a measured shortcut-to-visible-window test or
+proof of renderer selection. Other domain timeout messages remain outside
+this SD-only change. The AppImage still exposes `virtio-gpu-gl-pci`.
+
+Cursor/new image follow-up: with GTK, `gd_update_cursor()` hides the host
+cursor whenever an absolute input device such as the virtio tablet is active.
+If the guest cursor path fails or is hidden, that can leave no visible pointer;
+this is a plausible mechanism, not a proven diagnosis of the user's desktop.
+QEMU supports `-display gtk,gl=on,show-cursor=on` to force a host cursor; it
+may not match guest cursor shape and can produce two pointers. The AppImage
+with that option started and self-exited the demo under nested headless Weston
+Wayland (`/tmp/opencode/cursor-gtk-wayland.log`); pointer visibility was not
+verified there and needs testing on the user's interactive Wayland desktop.
+The fresh `Armbian_community_26.11.0-trunk.120_Orangepi5b_resolute_edge_7.3.1_kde-plasma_desktop.img.xz`
+was extracted to a disposable raw copy, leaving the archive untouched. Its own
+SPL and BL31 reached U-Boot at `0x200000`, but U-Boot encountered a
+synchronous data abort (ESR `0x96000050`, ELR `0x208dec`) before reaching
+Linux. The filename identifies an edge 7.3.1 image, but the running kernel
+version and virgl behavior could not be verified. Guest log:
+`/tmp/opencode/slowdiag-opi5b-serial.log`; QEMU diagnostic log empty.
+
+Orange Pi 5B follow-up: its vendor U-Boot first performed a 32-bit write at
+`0xfdf32208` (external abort); the model now provides the adjacent 4 KiB
+`0xfdf32000` register-file stub. After that it reached its U-Boot banner,
+then a 64-bit store to xHCI DCBAAP `0xfc000050` aborted because the DWC3
+stub allowed only 32-bit guest accesses. The two modeled xHCI/DWC3 windows
+now accept 64-bit accesses split into 32-bit register operations; focused
+`scripts/test-rk-boot-devices.py` writeq/readl regression passed. With both
+changes, stock U-Boot reached `Starting kernel`. Default 4 GiB still failed:
+the image's own firmware advertised 15.7 GiB (memory banks through 16 GiB).
+With `-m 16G`, a fresh disposable extraction reached
+`orangepi5b login: root (automatic login)` and `Press Enter to start the first
+login setup on this console.` The runner waited for the old `root@orangepi5`
+prompt, so no reliable login wall time was captured; no first-login answers,
+Plasma desktop, virgl, input or networking were verified. Its filename and
+boot filesystem identify kernel `7.3.1-edge-rockchip64`; the serial console
+used low verbosity and did not independently print the running version.
+Serial: `/tmp/opencode/slowdiag-opi5b16-serial.log`; default-RAM trace:
+`/tmp/opencode/opi5b-kernel-qemu.log`. AppImage rebuilt after each source
+change and demo self-exited rc=0; P9 and SD runtime-PM AppImage regressions
+passed. Existing non-SD media power-domain warnings remain. The user's
+previous cursor workaround `show-cursor=on` did not help, and they also
+reported missing networking; neither issue is resolved by this boot work.
+
+Fresh 5B virgl desktop attempt: completed first-login setup on a disposable
+extraction (test user `opi`), confirmed running kernel
+`7.3.1-edge-rockchip64`, and SDDM started, but no Plasma user session was
+automatically started. The VNC view of the virtio display said `Display
+output is not active`. Guest `/sys/class/drm/card0` was the Rockchip
+display-subsystem, `/sys/bus/pci/devices` was empty, and live DT PCIe nodes
+`pcie@fe180000` and `pcie@fe190000` both reported `disabled`; unlike the
+previous 5 image the guest never enumerated the PCI GPU. No claim about
+virgl, GLX or compositor acceleration can be made. Logs:
+`/tmp/opencode/opi5b-pci-status.log`, `/tmp/opencode/opi5b-dtb-status.log`.
+The initial renderer script waited unnecessarily for a KWin process that
+could not appear before SDDM login. Investigate how to expose an appropriate
+PCIe controller for this board without silently modifying the stock image or
+its DTB; cursor and networking remain separate issues.
+
+Fresh Orange Pi 5 archive virgl test: extracted a disposable raw copy of
+`Armbian_26.8.1_Orangepi5_resolute_current_6.18.43_kde-plasma_desktop.img.xz`,
+completed first-login setup, created a test user and configured SDDM autologin
+on that copy only. No Zink override was present in the checked guest
+environment files. The stock DTB enabled `pcie@fe190000` and Linux bound
+the virtio PCI GPU. AppImage with `virtio-gpu-gl-pci`, EGL-headless on
+`renderD128`, and VNC: KWin `supportInformation` explicitly reported
+`Compositing Type: OpenGL` and `OpenGL renderer string: virgl (AMD Radeon
+RX 7800 XT ...)`; XWayland `glxinfo -B` reported virgl too. `glxgears -info`
+reported virgl and rendered 88 frames/5.0 s and 107 frames/5.1 s; timeout
+rc=124 was expected. `/tmp/opencode/opi5-pristine-gears.png` shows gears on
+the Plasma wallpaper. Logs: `/tmp/opencode/opi5-pristine-glprobe.log`,
+`/tmp/opencode/opi5-pristine-gears.log`. This establishes accelerated
+compositing and a GLX test client on this host, not reliable input, native GTK
+presentation, a visible panel, networking, or performance on another host.
+
+Input/network follow-up: the original CLI attached GPU to PCI slot 0 but
+keyboard/tablet to slots 1/2. The DesignWare root port exposes only slot 0;
+Linux enumerated only the GPU, explaining why those input devices were not
+available. Use GPU `addr=0.0,multifunction=on`, keyboard `addr=0.1`, tablet
+`addr=0.2`, NIC `addr=0.3` on `dw-pcie`. The previous AppImage also lacked
+SLIRP: installed `libslirp-dev`, enabled build option `-Dslirp=enabled`, and
+rebuilt the AppImage (bundles `libslirp.so.0`; demo self-exited rc=0). On a
+fresh disposable Orange Pi 5 raw copy, Linux enumerated all four PCI
+functions; input devices appeared in `/proc/bus/input/devices`, the NIC got
+`10.0.2.15` by DHCP, resolved `deb.debian.org`, and an HTTPS request returned
+HTTP/2 200 (`/tmp/opencode/opi5-multifunction-check.log`). VNC pointer
+injection increased the tablet virtqueue interrupt count from 8 to 12;
+the separate evdev read attempt returned zero bytes, so guest-visible pointer
+motion/clicks and the user's GTK cursor are not yet verified. Updated
+`scripts/run-virgl-desktop.py` to use these addresses and user networking.
+As explicitly requested, the repository's named Orange Pi 5 `.img` was
+replaced with a fresh archive extraction; the file and decompressed archive
+both SHA256 `c9f588bb5a9741e7acb3cc57fe5773b67cbaef5aa58afc11bc97127fdccb80ff`.

@@ -49,12 +49,12 @@ set -euo pipefail
 
 RK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
-DDR_BLOB="${DDR_BLOB:-$RK_DIR/rk/img/rk3588_ddr_lp4_2112MHz_lp5_2400MHz_v1.20-armbian.bin}"
+DDR_BLOB="${DDR_BLOB:-$RK_DIR/experiments/rk/img/rk3588_ddr_lp4_2112MHz_lp5_2400MHz_v1.20-armbian.bin}"
 UBOOT_DEFCONFIG="${UBOOT_DEFCONFIG:-orangepi-5-rk3588s_defconfig}"
 UBOOT_JOBS="${UBOOT_JOBS:-$(nproc)}"
 OUT_DIR="$RK_DIR/images/opi5"
-BL31_ELF="$RK_DIR/atf/build/rk3588/release/bl31/bl31.elf"
-UBOOT_SRC="$RK_DIR/u-boot-opi5"
+BL31_ELF="$RK_DIR/experiments/atf/build/rk3588/release/bl31/bl31.elf"
+UBOOT_SRC="$RK_DIR/experiments/u-boot-opi5"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 

@@ -82,6 +82,12 @@ struct RkDisplay {
     hwaddr fb_addr;
     uint64_t fb_stride;
     uint32_t width, height;
+    uint8_t *indexed_pixels;
+    size_t indexed_size;
+    uint32_t indexed_palette[256];
+    uint32_t indexed_sw, indexed_sh, indexed_dw, indexed_dh, indexed_ox, indexed_oy;
+    uint8_t *rgb_snapshot;
+    size_t rgb_snapshot_size;
 };
 
 static void rk_display_unmap(pixman_image_t *image, void *unused)
@@ -171,6 +177,18 @@ static bool rk_display_indexed(RkDisplay *s, uint32_t addr, uint32_t vir)
         return false;
     }
     physical_memory_read(VOP2_BASE + 0x6000, palette, sizeof(palette));
+    /* The VOP timer calls us every virtual frame, even for a static menu.
+     * Avoid rescaling millions of pixels unless scanout or the LUT changed. */
+    if (s->surface_ready && s->indexed_surface && s->width == width &&
+        s->height == height && s->fb_addr == addr && s->fb_stride == stride &&
+        s->indexed_sw == sw && s->indexed_sh == sh && s->indexed_dw == dw &&
+        s->indexed_dh == dh && s->indexed_ox == ox && s->indexed_oy == oy &&
+        s->indexed_size == requested && s->indexed_pixels &&
+        !memcmp(s->indexed_palette, palette, sizeof(palette)) &&
+        !memcmp(s->indexed_pixels, pixels, requested)) {
+        physical_memory_unmap(pixels, mapsize, false, 0);
+        return true;
+    }
     if (!s->surface_ready || !s->indexed_surface || s->width != width ||
         s->height != height) {
         ds = qemu_create_displaysurface(width, height);
@@ -180,18 +198,33 @@ static bool rk_display_indexed(RkDisplay *s, uint32_t addr, uint32_t vir)
         s->width = width;
         s->height = height;
     }
+    if (s->indexed_size != requested) {
+        s->indexed_pixels = g_realloc(s->indexed_pixels, requested);
+        s->indexed_size = requested;
+    }
+    /* Render the snapshot we compare on the next frame, not live guest RAM. */
+    memcpy(s->indexed_pixels, pixels, requested);
     ds = qemu_console_surface(s->con);
     memset(surface_data(ds), 0, surface_stride(ds) * height);
     for (uint32_t y = 0; y < MIN(dh, height - oy); y++) {
         uint32_t *dst = (uint32_t *)(surface_data(ds) +
                                      (oy + y) * surface_stride(ds));
-        const uint8_t *row = pixels + (uint64_t)y * sh / dh * stride;
+        const uint8_t *row = s->indexed_pixels + (uint64_t)y * sh / dh * stride;
 
         for (uint32_t x = 0; x < MIN(dw, width - ox); x++) {
             dst[ox + x] = le32_to_cpu(palette[row[(uint64_t)x * sw / dw]]) &
                           0xffffff;
         }
     }
+    memcpy(s->indexed_palette, palette, sizeof(palette));
+    s->fb_addr = addr;
+    s->fb_stride = stride;
+    s->indexed_sw = sw;
+    s->indexed_sh = sh;
+    s->indexed_dw = dw;
+    s->indexed_dh = dh;
+    s->indexed_ox = ox;
+    s->indexed_oy = oy;
     physical_memory_unmap(pixels, mapsize, false, 0);
     qemu_console_update_full(s->con);
     return true;
@@ -238,7 +271,25 @@ static bool rk_display_gfx_update(void *opaque)
     /* same scanout config: guest RAM backs the surface, nothing to do */
     if (s->surface_ready && !s->indexed_surface && addr == s->fb_addr && width == s->width &&
         height == s->height && stride == s->fb_stride) {
-        qemu_console_update_full(s->con);
+        uint8_t *pixels = surface_data(qemu_console_surface(s->con));
+        size_t row_size = (size_t)width * 4;
+        uint32_t first = height, last = 0;
+
+        /* The mapped surface follows guest RAM, but notifying the frontend of
+         * a full 1080p frame every tick is expensive for a mostly static UI. */
+        for (uint32_t y = 0; y < height; y++) {
+            uint8_t *src = pixels + y * stride;
+            uint8_t *old = s->rgb_snapshot + y * row_size;
+
+            if (memcmp(old, src, row_size)) {
+                memcpy(old, src, row_size);
+                first = MIN(first, y);
+                last = y;
+            }
+        }
+        if (first < height) {
+            qemu_console_update(s->con, 0, first, width, last - first + 1);
+        }
         return true;
     }
 
@@ -268,6 +319,12 @@ static bool rk_display_gfx_update(void *opaque)
     s->fb_stride = stride;
     s->width = width;
     s->height = height;
+    s->rgb_snapshot_size = (size_t)width * height * 4;
+    s->rgb_snapshot = g_realloc(s->rgb_snapshot, s->rgb_snapshot_size);
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(s->rgb_snapshot + (size_t)y * width * 4,
+               (uint8_t *)data + y * stride, (size_t)width * 4);
+    }
     qemu_console_update_full(s->con);
     return true;
 }
@@ -315,11 +372,20 @@ static void rk3588_display_class_init(ObjectClass *oc, const void *data)
     dc->user_creatable = false;
 }
 
+static void rk3588_display_finalize(Object *obj)
+{
+    RkDisplay *s = RK3588_DISPLAY(obj);
+
+    g_free(s->indexed_pixels);
+    g_free(s->rgb_snapshot);
+}
+
 static const TypeInfo rk3588_display_types[] = {
     {
         .name = TYPE_RK3588_DISPLAY,
         .parent = TYPE_SYS_BUS_DEVICE,
         .instance_size = sizeof(RkDisplay),
+        .instance_finalize = rk3588_display_finalize,
         .class_init = rk3588_display_class_init,
     },
 };

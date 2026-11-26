@@ -2,6 +2,7 @@
 #include "qemu/osdep.h"
 #include "hw/core/sysbus.h"
 #include "ui/input.h"
+#include "ui/console.h"
 #include "rk3588-i2chid.h"
 #include "rk3588-stubs.h"
 
@@ -160,17 +161,27 @@ static void tp_input_event(DeviceState *dev, QemuConsole *src,
         }
         break;
     case INPUT_EVENT_KIND_ABS:
-        /* console pointer positions arrive as absolute; derive deltas */
+        /* Absolute events use QEMU's normalized 0..32767 coordinates, not
+         * pixels. Convert positions before differencing so subpixel motion
+         * accumulates naturally rather than amplifying every delta. */
         if (evt->abs.axis == INPUT_AXIS_X) {
+            int x = qemu_input_scale_axis(evt->abs.value,
+                                          INPUT_EVENT_ABS_MIN,
+                                          INPUT_EVENT_ABS_MAX, 0,
+                                          qemu_console_get_width(src, 1920) - 1);
             if (last_abs_x >= 0) {
-                pend_dx += evt->abs.value - last_abs_x;
+                pend_dx += x - last_abs_x;
             }
-            last_abs_x = evt->abs.value;
+            last_abs_x = x;
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            int y = qemu_input_scale_axis(evt->abs.value,
+                                          INPUT_EVENT_ABS_MIN,
+                                          INPUT_EVENT_ABS_MAX, 0,
+                                          qemu_console_get_height(src, 1080) - 1);
             if (last_abs_y >= 0) {
-                pend_dy += evt->abs.value - last_abs_y;
+                pend_dy += y - last_abs_y;
             }
-            last_abs_y = evt->abs.value;
+            last_abs_y = y;
         }
         break;
     case INPUT_EVENT_KIND_BTN:

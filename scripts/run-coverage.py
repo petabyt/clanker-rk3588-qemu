@@ -122,9 +122,9 @@ def main():
     qemu = rd.pick_qemu(args.qemu)
     print(f"[p19] QEMU: {qemu}", flush=True)
 
-    bl31 = os.path.join(ROOT, "atf/build/rk3588/release/bl31/bl31.elf")
-    uboot = os.path.join(ROOT, "u-boot/u-boot.bin")
-    qdtb = os.path.join(ROOT, "u-boot/dts/dt.dtb")
+    bl31 = os.path.join(ROOT, "experiments/atf/build/rk3588/release/bl31/bl31.elf")
+    uboot = os.path.join(ROOT, "experiments/u-boot/u-boot.bin")
+    qdtb = os.path.join(ROOT, "experiments/u-boot/dts/dt.dtb")
     vmlinuz = os.path.join(ROOT, "images/armbian/vmlinuz-6.18.43-current-rockchip64")
     image = (args.image if os.path.isabs(args.image)
              else os.path.join(ROOT, args.image))

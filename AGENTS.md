@@ -6,6 +6,12 @@ Cool-Pi Genbook), booting the ./rk bare-metal bootloader -> U-Boot -> upstream L
 edk2-rk3588. Ambitious, phased; see plan.md for milestones and exit criteria.
 
 ## Layout
+- After the workspace reorganization, legacy firmware and test inputs are under
+  `experiments/`: `experiments/rk/`, `experiments/atf/`, `experiments/u-boot/`,
+  `experiments/edk2/`, `experiments/initramfs/` and `experiments/dts/`.
+  The active bootloader project is `futo-bootloader/rk/`; Arm and Rockchip
+  reference material is under `private/`, and project plans are under `notes/`.
+  Historical paths elsewhere in this file refer to the former layout.
 - ./qemu/    upstream QEMU clone. DO NOT edit by hand. Changes = qemu.patch only,
               applied idempotently by the top-level Makefile (see Rules #1).
 - ./src/     all RK3588 QEMU sources (machine + device models). Reached from QEMU
@@ -143,7 +149,7 @@ gmac MDIO answers no-PHY (-ENODEV, no MII scan); virtio transports moved to SPI
 gpu stub widened to 2 MB; sram@fd600000 spanned. qemu.patch now covers 11 files
 (adds hw/virtio/virtio-mmio.c, hw/usb/hcd-ohci.c, ui/console.c — the last two
 had been silently dropped by a partial regen; status == patch list verified). Gates: run-coverage rc=0, make appimage + AppImage demo
-self-exit rc=0, ./p9-exit.sh rc=0, ./p17-exit.sh rc=0, desktop verified through
+self-exit rc=0, scripts/p9-exit.sh rc=0, scripts/p17-exit.sh rc=0, desktop verified through
 plasmashell + kwin_wayland on the AppImage (serial never prints plasmashell — check
 with a typed `ps aux`), make all-dtb green. Deferred by user decision ("defer
 media/gpu"): rga/hantro/vdec/av1/panthor bind-but-dead (armed domains fail every
@@ -157,7 +163,7 @@ Shutdown (2026-10-08, post-milestone): PSCI_SYSTEM_OFF (demo fw_handler / U-Boot
 `poweroff` via CONFIG_CMD_POWEROFF+CONFIG_SYSRESET_CMD_POWEROFF+CONFIG_SYSRESET_PSCI)
 -> EL3 firmware plat_shutdown() (rk/src/rk3588/io.c) writes 'OFF!' (0x4f464621)
 to 0xfd58affc (grf-boot window) -> QEMU rk_stub_poweroff_write hook
-(src/rk3588-stubs.c) -> qemu_system_shutdown_request: demo, ./p9-exit.sh and
+(src/rk3588-stubs.c) -> qemu_system_shutdown_request: demo, scripts/p9-exit.sh and
 U-Boot `poweroff` all exit QEMU rc=0 on their own (plan.md P8 "Shutdown
 follow-up").  Firmware DTB also carries a /psci node; U-Boot uses its own linked
 DTB as control FDT (fdtdec_setup ignores the x0 DTB), which already had
@@ -173,7 +179,7 @@ config_smart_layer) and maps guest RAM at fb=0xd0000000 (1920x1080 XRGB8888)
 into a qemu_create_displaysurface_from surface exactly like hw/display/ramfb.c;
 QEMU invokes gfx_update before UI redraws and inside screendump's
 qemu_console_co_wait_update, so no timer and no display backend needed.
-Exit: ./p9-exit.sh — boots demo, HMP screendump over unix monitor socket after
+Exit: scripts/p9-exit.sh — boots demo, HMP screendump over unix monitor socket after
 "Memory description map:", no `quit` (guest PSCI_SYSTEM_OFF must exit QEMU rc=0);
 asserts qemu rc=0, monitor rc=0 + PPM 1920x1080 with bg #4398d7 + white font
 present; qemu-p9.log empty; P8 canonical command self-exits rc=0 after
@@ -230,7 +236,7 @@ Exits pasted in plan.md.
 P20 (2026-10-26) DONE: the unmodified in-repo Armbian 26.8.1 OPi5 image
 boots from SD unit 0 through its own DDR/SPL/TF-A/U-Boot/boot.scr/kernel/
 initramfs/DTB to `orangepi5 login: root (automatic login)`.  Exit:
-`./p20-exit.sh` rc=0, login at 362 s, Linux online mask 0xff, zero serial
+`scripts/p20-exit.sh` rc=0, login at 362 s, Linux online mask 0xff, zero serial
 stdin, base SHA256 and logical first 16 MiB unchanged, QEMU diagnostic log
 0 bytes.  `make run-opi5-raw` runs the same fresh-overlay login harness;
 `make test-boot-devices` regresses asynchronous Rockchip broadcast timer

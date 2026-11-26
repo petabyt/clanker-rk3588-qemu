@@ -208,9 +208,9 @@ def main():
         print("[run-desktop] no /dev/fuse - using APPIMAGE_EXTRACT_AND_RUN=1",
               flush=True)
 
-    bl31 = os.path.join(ROOT, "atf/build/rk3588/release/bl31/bl31.elf")
-    uboot = os.path.join(ROOT, "u-boot/u-boot.bin")
-    qdtb = os.path.join(ROOT, "u-boot/dts/dt.dtb")
+    bl31 = os.path.join(ROOT, "experiments/atf/build/rk3588/release/bl31/bl31.elf")
+    uboot = os.path.join(ROOT, "experiments/u-boot/u-boot.bin")
+    qdtb = os.path.join(ROOT, "experiments/u-boot/dts/dt.dtb")
     vmlinuz = os.path.join(ROOT, "images/armbian/vmlinuz-6.18.43-current-rockchip64")
     gdtb = (args.dtb or os.path.join(ROOT, "images", "armbian",
                                      "rk3588s-orangepi-5-all.dtb"))

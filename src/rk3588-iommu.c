@@ -24,11 +24,10 @@
  *      4 ZAP_CACHE / 5 PAGE_FAULT_DONE     -> no-op
  *      6 FORCE_RESET                      -> dte=0, paging=stall=0
  *
- * Translation is NOT modeled: the driver only touches guest RAM page
- * tables, so attach/map/unmap all succeed without hardware involvement.
- * Device DMA behind this IOMMU must be identity (iommu.passthrough=1) or
- * accept garbage; the VOP2 scanout in rk3588-display.c reads framebuffers
- * by physical address.
+ * DMA consumers may use the explicit rk3588_iommu_dma_{read,write} API
+ * for v2 page-table translation. Existing devices are not wired to it:
+ * VOP2 scanout still reads physical addresses. Fault interrupts and
+ * translation-cache invalidation notifications are not modeled.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -40,6 +39,7 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "rk3588-iommu.h"
+#include "rk3588-iommu-walk.h"
 
 #define RK_MMU_DTE_ADDR    0x00
 #define RK_MMU_STATUS      0x04
@@ -60,6 +60,45 @@ struct RkIommuState {
     uint32_t dte;
     uint64_t size;
 };
+
+static bool rk_iommu_read32(void *opaque, uint64_t addr, uint32_t *value)
+{
+    uint8_t bytes[4];
+
+    if (address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                           bytes, sizeof(bytes)) != MEMTX_OK) {
+        return false;
+    }
+    *value = ldl_le_p(bytes);
+    return true;
+}
+
+static int rk_iommu_transfer(void *opaque, uint64_t addr, void *buf,
+                             size_t len, bool write)
+{
+    return address_space_rw(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                            buf, len, write);
+}
+
+static MemTxResult rk_iommu_dma(RkIommuState *s, uint32_t iova, void *buf,
+                                size_t len, bool write)
+{
+    return rk_iommu_v2_transfer(s->dte, s->paging, s->stall, iova, buf, len,
+                                write, rk_iommu_read32, rk_iommu_transfer, s,
+                                MEMTX_ERROR);
+}
+
+MemTxResult rk3588_iommu_dma_read(RkIommuState *s, uint32_t iova,
+                                 void *buf, size_t len)
+{
+    return rk_iommu_dma(s, iova, buf, len, false);
+}
+
+MemTxResult rk3588_iommu_dma_write(RkIommuState *s, uint32_t iova,
+                                  const void *buf, size_t len)
+{
+    return rk_iommu_dma(s, iova, (void *)buf, len, true);
+}
 
 static uint64_t rk_iommu_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -179,7 +218,7 @@ static void rk_iommu_register_types(void)
 }
 type_init(rk_iommu_register_types)
 
-void rk3588_create_iommu_window(uint64_t base, uint64_t size)
+RkIommuState *rk3588_create_iommu_window(uint64_t base, uint64_t size)
 {
     DeviceState *dev = qdev_new(TYPE_RK3588_IOMMU);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
@@ -189,4 +228,5 @@ void rk3588_create_iommu_window(uint64_t base, uint64_t size)
     /* Priority 1 so these win over plain storage stubs (npu/codecs/vdec). */
     memory_region_add_subregion_overlap(get_system_memory(), base,
                                         sysbus_mmio_get_region(sbd, 0), 1);
+    return RK3588_IOMMU(dev);
 }

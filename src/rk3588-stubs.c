@@ -31,8 +31,14 @@
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
 #include "hw/core/cpu.h"
+#include "hw/usb/usb.h"
+#include "qemu/module.h"
+#include "qemu/error-report.h"
+#include "qapi/error.h"
 #include "qom/object.h"
 #include "system/memory.h"
+#include "system/address-spaces.h"
+#include "system/reset.h"
 #include "system/runstate.h"
 #include "rk3588-stubs.h"
 #include "rk3588-dwmshc.h"
@@ -52,6 +58,13 @@ typedef uint64_t (*RkStubReadHook2)(struct RkStub *s, uint32_t stored,
 
 /* Set by rk3588.c when -bios is a TF-A (BL31) ELF; see rk-stubs header. */
 bool rk3588_atf_mode;
+bool rk3588_real_bootrom_mode;
+bool rk3588_vdec0_power;
+/* Virtual provisioned security markers; volatile across QEMU processes. */
+static uint32_t rk3588_secure_fuses[65536] = {
+    [1] = 0x5a,
+    [0x17] = 0xa5,
+};
 
 typedef struct RkStubResetVal {
     hwaddr off;
@@ -89,7 +102,391 @@ typedef struct RkStub {
     RkStubReadHook2 read_hook2;
     RkStubWriteHook write_hook;
     hwaddr plain_lo, plain_hi;
+    uint32_t dwc3_event_pos;
+    qemu_irq dwc3_irq;
+    USBDevice *dwc3_gadget;
+    USBPacket *dwc3_control_packet;
+    uint8_t *dwc3_control_data;
+    uint32_t dwc3_control_length;
+    bool dwc3_control_in;
+    QEMUTimer *dwc3_status_timer;
+    uint32_t dwc3_status_events;
+    struct {
+        uint32_t config[3];
+        uint32_t resources;
+        uint64_t trb;
+        uint32_t offset;
+        bool configured;
+        bool transfer_active;
+        bool stalled;
+    } dwc3_ep[16];
 } RkStub;
+
+/* An explicitly attached QEMU USB device represents the other end of the
+ * OTG cable.  This is deliberately opt-in and not a physical USB passthrough. */
+static RkStub *rk3588_otg_stub;
+
+static void rk_stub_dwc3_pullup(RkStub *s, bool on)
+{
+    Error *err = NULL;
+    USBDevice *dev = s->dwc3_gadget;
+
+    if (!dev || !dev->port) {
+        return;
+    }
+    if (on && !dev->attached) {
+        usb_device_attach(dev, &err);
+        if (err) {
+            error_report_err(err);
+        }
+    } else if (!on && dev->attached) {
+        usb_device_detach(dev);
+    }
+}
+
+static void rk_stub_dwc3_update_irq(RkStub *s)
+{
+    if (s->dwc3_irq) {
+        qemu_set_irq(s->dwc3_irq, s->regs[0xc40c / 4] != 0 &&
+                     !(s->regs[0xc408 / 4] & (1u << 31)));
+    }
+}
+
+static void rk_stub_dwc3_reset(void *opaque)
+{
+    RkStub *s = opaque;
+
+    rk_stub_dwc3_pullup(s, false);
+    s->dwc3_control_packet = NULL;
+    s->dwc3_control_data = NULL;
+    s->dwc3_control_length = 0;
+    s->dwc3_control_in = false;
+    timer_del(s->dwc3_status_timer);
+    s->dwc3_status_events = 0;
+    s->dwc3_event_pos = 0;
+    memset(s->dwc3_ep, 0, sizeof(s->dwc3_ep));
+    memset(&s->regs[0xc400 / 4], 0, 0x10);
+    memset(&s->regs[0xc700 / 4], 0, 0x24);
+    memset(&s->regs[0xc800 / 4], 0, 0x100);
+    rk_stub_dwc3_update_irq(s);
+}
+
+/* Events are visible to polling and interrupt-driven code. */
+static void rk_stub_dwc3_event(RkStub *s, uint32_t event)
+{
+    uint32_t size = s->regs[0xc408 / 4] & 0xfffc;
+    uint32_t *count = &s->regs[0xc40c / 4];
+    uint64_t addr = s->regs[0xc400 / 4] |
+                    ((uint64_t)s->regs[0xc404 / 4] << 32);
+    uint32_t le = cpu_to_le32(event);
+
+    if (size < 32 || *count > size - 4) {
+        return;
+    }
+    s->dwc3_event_pos %= size;
+    if (address_space_write(&address_space_memory, addr + s->dwc3_event_pos,
+                            MEMTXATTRS_UNSPECIFIED, &le, sizeof(le)) != MEMTX_OK) {
+        return;
+    }
+    s->dwc3_event_pos = (s->dwc3_event_pos + 4) % size;
+    *count += 4;
+    rk_stub_dwc3_update_irq(s);
+}
+
+static void rk_stub_dwc3_status_complete(void *opaque)
+{
+    RkStub *s = opaque;
+    uint32_t pending = s->dwc3_status_events;
+
+    s->dwc3_status_events = 0;
+    for (unsigned ep = 0; ep < 2; ep++) {
+        if (pending & (1u << ep)) {
+            rk_stub_dwc3_event(s, (ep << 1) | (1u << 6));
+        }
+    }
+}
+
+/* Walk consecutive EP0 TRBs, including chains used by the MaskROM for OUT
+ * requests.  Validate the entire chain before changing ownership. */
+static bool rk_stub_dwc3_ep0_trb(RkStub *s, unsigned ep, unsigned type,
+                                 uint8_t *data, uint32_t *length, bool in)
+{
+    uint32_t trbs[128][4], count = 0, copied = 0;
+    uint64_t ptr = s->dwc3_ep[ep].trb;
+
+    if (!s->dwc3_ep[ep].transfer_active) {
+        return false;
+    }
+    do {
+        uint32_t *trb;
+
+        if (count == ARRAY_SIZE(trbs)) {
+            return false;
+        }
+        trb = trbs[count];
+        if (address_space_read(&address_space_memory, ptr + count * 16,
+                               MEMTXATTRS_UNSPECIFIED, trb, 16) != MEMTX_OK) {
+            return false;
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            trb[i] = le32_to_cpu(trb[i]);
+        }
+        if (!(trb[3] & 1) || ((trb[3] >> 4) & 0x3f) != type) {
+            return false;
+        }
+        count++;
+    } while (trbs[count - 1][3] & 4);
+
+    for (unsigned i = 0; i < count; i++) {
+        uint32_t *trb = trbs[i];
+        uint32_t capacity = trb[2] & 0xffffff;
+        uint32_t n = MIN(*length - copied, capacity);
+        uint64_t addr = trb[0] | ((uint64_t)trb[1] << 32);
+
+        if (n && (in ? address_space_read(&address_space_memory, addr,
+                         MEMTXATTRS_UNSPECIFIED, data + copied, n) :
+                       address_space_write(&address_space_memory, addr,
+                         MEMTXATTRS_UNSPECIFIED, data + copied, n)) != MEMTX_OK) {
+            return false;
+        }
+        copied += n;
+        trb[2] = cpu_to_le32((trb[2] & ~0xffffffu) | (capacity - n));
+        trb[3] = cpu_to_le32(trb[3] & ~1u);
+        if (address_space_write(&address_space_memory, ptr + i * 16 + 8,
+                                MEMTXATTRS_UNSPECIFIED, &trb[2], 8) != MEMTX_OK) {
+            return false;
+        }
+    }
+    *length = copied;
+    s->dwc3_ep[ep].transfer_active = false;
+    if (type == 3 || type == 4) {
+        /* A status transaction cannot finish in the MMIO command write.
+         * The ROM drains old events after issuing this command. */
+        s->dwc3_status_events |= 1u << ep;
+        timer_mod(s->dwc3_status_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    } else {
+        rk_stub_dwc3_event(s, (ep << 1) | (1u << 6));
+    }
+    return true;
+}
+
+static void rk_stub_dwc3_control_kick(RkStub *s, unsigned ep)
+{
+    uint32_t n = s->dwc3_control_length;
+    USBPacket *packet = s->dwc3_control_packet;
+
+    if (!packet || ep != (s->dwc3_control_in ? 1 : 0)) {
+        uint32_t zero = 0;
+
+        if (ep == (s->dwc3_control_in ? 0 : 1) &&
+            (rk_stub_dwc3_ep0_trb(s, ep, 3, NULL, &zero, false) ||
+             rk_stub_dwc3_ep0_trb(s, ep, 4, NULL, &zero, false)) && packet) {
+            s->dwc3_control_packet = NULL;
+            packet->actual_length = s->dwc3_control_length;
+            packet->status = USB_RET_SUCCESS;
+            usb_generic_async_ctrl_complete(s->dwc3_gadget, packet);
+        }
+        return;
+    }
+    if (n && rk_stub_dwc3_ep0_trb(s, ep, 5, s->dwc3_control_data, &n,
+                                   s->dwc3_control_in)) {
+        /* Request the opposite-direction control status stage. */
+        rk_stub_dwc3_event(s, ((ep ^ 1) << 1) | (3u << 6) | (2u << 12));
+        if (s->dwc3_control_in) {
+            s->dwc3_control_packet = NULL;
+            packet->actual_length = n;
+            packet->status = USB_RET_SUCCESS;
+            usb_generic_async_ctrl_complete(s->dwc3_gadget, packet);
+        } else {
+            s->dwc3_control_length = 0;
+        }
+    }
+}
+
+typedef struct Rk3588OtgGadget {
+    USBDevice parent_obj;
+    RkStub *controller;
+} Rk3588OtgGadget;
+
+static void rk_otg_gadget_reset(USBDevice *dev)
+{
+    RkStub *s = ((Rk3588OtgGadget *)dev)->controller;
+    uint32_t enabled = s->regs[0xc708 / 4];
+
+    /* Device events: USB reset (1), followed by connect-done (2). */
+    if (enabled & (1u << 1)) {
+        rk_stub_dwc3_event(s, 1u | (1u << 8));
+    }
+    if (enabled & (1u << 2)) {
+        rk_stub_dwc3_event(s, 1u | (2u << 8));
+    }
+}
+
+static void rk_otg_gadget_control(USBDevice *dev, USBPacket *p, int request,
+                                  int value, int index, int length, uint8_t *data)
+{
+    Rk3588OtgGadget *gadget = (Rk3588OtgGadget *)dev;
+    RkStub *s = gadget->controller;
+    uint8_t setup[8] = { request >> 8, request, value, value >> 8,
+                         index, index >> 8, length, length >> 8 };
+    uint32_t n = sizeof(setup);
+
+    if (s->dwc3_ep[0].stalled || s->dwc3_ep[1].stalled) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+    if (s->dwc3_control_packet ||
+        !rk_stub_dwc3_ep0_trb(s, 0, 2, setup, &n, false) || n != sizeof(setup)) {
+        p->status = USB_RET_NAK;
+        return;
+    }
+    s->dwc3_control_data = data;
+    s->dwc3_control_length = length;
+    s->dwc3_control_in = !!(request & 0x8000);
+    rk_stub_dwc3_event(s, ((length ? s->dwc3_control_in : 1) << 1) |
+                           (3u << 6) | ((length ? 1u : 2u) << 12));
+    if (request == USB_REQ_SET_ADDRESS) {
+        /* xHCI retains its address-zero queue until this command returns. */
+        dev->addr = value;
+        p->status = USB_RET_SUCCESS;
+        return;
+    }
+    s->dwc3_control_packet = p;
+    p->status = USB_RET_ASYNC;
+}
+
+static void rk_otg_gadget_data(USBDevice *dev, USBPacket *p)
+{
+    RkStub *s = ((Rk3588OtgGadget *)dev)->controller;
+    unsigned ep = p->ep->nr * 2 + (p->pid == USB_TOKEN_IN);
+    uint32_t trb[4], capacity, control, remaining, n;
+    uint64_t ptr, addr;
+    g_autofree uint8_t *buf = NULL;
+    bool in = p->pid == USB_TOKEN_IN;
+    bool complete;
+
+    if (ep >= ARRAY_SIZE(s->dwc3_ep)) {
+        p->status = USB_RET_NAK;
+        return;
+    }
+    if (s->dwc3_ep[ep].stalled) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+    if (!s->dwc3_ep[ep].transfer_active) {
+        p->status = USB_RET_NAK;
+        return;
+    }
+    ptr = s->dwc3_ep[ep].trb;
+    if (address_space_read(&address_space_memory, ptr, MEMTXATTRS_UNSPECIFIED,
+                           trb, sizeof(trb)) != MEMTX_OK) {
+        p->status = USB_RET_IOERROR;
+        return;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(trb); i++) {
+        trb[i] = le32_to_cpu(trb[i]);
+    }
+    control = trb[3];
+    capacity = trb[2] & 0xffffff;
+    if (!(control & 1) || ((control >> 4) & 0x3f) != 1 || (control & 4) ||
+        s->dwc3_ep[ep].offset > capacity || p->iov.size > 65536) {
+        p->status = USB_RET_NAK;
+        return;
+    }
+    addr = trb[0] | ((uint64_t)trb[1] << 32);
+    remaining = capacity - s->dwc3_ep[ep].offset;
+    n = MIN(p->iov.size, remaining);
+    buf = g_malloc(MAX(n, 1));
+    if (!in && n) {
+        usb_packet_copy(p, buf, n);
+    }
+    if (n && (in ? address_space_read(&address_space_memory,
+                    addr + s->dwc3_ep[ep].offset, MEMTXATTRS_UNSPECIFIED, buf, n) :
+                    address_space_write(&address_space_memory,
+                    addr + s->dwc3_ep[ep].offset, MEMTXATTRS_UNSPECIFIED, buf, n)) != MEMTX_OK) {
+        p->status = USB_RET_IOERROR;
+        return;
+    }
+    if (in && n) {
+        usb_packet_copy(p, buf, n);
+    }
+    s->dwc3_ep[ep].offset += n;
+    complete = s->dwc3_ep[ep].offset == capacity || n < p->iov.size ||
+               (!in && p->iov.size < ((s->dwc3_ep[ep].config[2] >> 3) & 0x7ff));
+    if (complete) {
+        trb[2] = cpu_to_le32((trb[2] & ~0xffffffu) |
+                             (capacity - s->dwc3_ep[ep].offset));
+        trb[3] = cpu_to_le32(control & ~1u);
+        if (address_space_write(&address_space_memory, ptr + 8,
+                                MEMTXATTRS_UNSPECIFIED, &trb[2], 8) != MEMTX_OK) {
+            p->status = USB_RET_IOERROR;
+            return;
+        }
+        s->dwc3_ep[ep].transfer_active = false;
+        rk_stub_dwc3_event(s, (ep << 1) | (1u << 6));
+    }
+    p->status = USB_RET_SUCCESS;
+}
+
+static void rk_otg_gadget_cancel(USBDevice *dev, USBPacket *p)
+{
+    RkStub *s = ((Rk3588OtgGadget *)dev)->controller;
+
+    if (s->dwc3_control_packet == p) {
+        s->dwc3_control_packet = NULL;
+    }
+}
+
+static void rk_otg_gadget_realize(USBDevice *dev, Error **errp)
+{
+    Rk3588OtgGadget *gadget = (Rk3588OtgGadget *)dev;
+
+    if (!rk3588_otg_stub || rk3588_otg_stub->dwc3_gadget) {
+        error_setg(errp, "RK3588 OTG controller missing or already connected");
+        return;
+    }
+    gadget->controller = rk3588_otg_stub;
+    gadget->controller->dwc3_gadget = dev;
+    dev->auto_attach = 0;
+    dev->speed = USB_SPEED_HIGH;
+    dev->speedmask = USB_SPEED_MASK_HIGH;
+}
+
+static void rk_otg_gadget_unrealize(USBDevice *dev)
+{
+    Rk3588OtgGadget *gadget = (Rk3588OtgGadget *)dev;
+
+    if (gadget->controller && gadget->controller->dwc3_gadget == dev) {
+        gadget->controller->dwc3_gadget = NULL;
+    }
+}
+
+static void rk_otg_gadget_class_init(ObjectClass *klass, const void *data)
+{
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->product_desc = "RK3588 OTG device";
+    uc->realize = rk_otg_gadget_realize;
+    uc->unrealize = rk_otg_gadget_unrealize;
+    uc->handle_reset = rk_otg_gadget_reset;
+    uc->handle_control = rk_otg_gadget_control;
+    uc->handle_data = rk_otg_gadget_data;
+    uc->cancel_packet = rk_otg_gadget_cancel;
+}
+
+static const TypeInfo rk_otg_gadget_type = {
+    .name = "rk3588-otg-gadget",
+    .parent = TYPE_USB_DEVICE,
+    .instance_size = sizeof(Rk3588OtgGadget),
+    .class_init = rk_otg_gadget_class_init,
+};
+
+static void rk_otg_gadget_register(void)
+{
+    type_register_static(&rk_otg_gadget_type);
+}
+type_init(rk_otg_gadget_register)
 
 /*
  * Power-off request word: plat_shutdown() (rk/src/rk3588/io.c) writes
@@ -159,6 +556,8 @@ static uint32_t rk_pd_media_armed;
 /* SDMMC domain and its separately controlled memory reset (RK3588 PMU2). */
 static bool rk_pd_sdmmc_off;
 static bool rk_pd_sdmmc_mem_off;
+static bool rk_pd_vdec0_off;
+static bool rk_pd_vdec0_mem_off;
 
 static void rk_stub_atf_poweroff_write(hwaddr off, uint64_t value)
 {
@@ -279,6 +678,11 @@ static uint64_t rk_stub_dwc3_read2(RkStub *s, uint32_t stored, hwaddr off)
         return 0x5533330a;      /* GSNPSID: ip id 0x5533 (DWC3), rev 3.30A */
     case 0xc704:
         return stored & ~(1u << 30);   /* DCTL: CSFTRST self-clears */
+    case 0xc70c:
+        /* Halt waits for both RunStop=0 and event acknowledgement. */
+        return (stored & ~(1u << 22)) |
+               (((s->regs[0xc704 / 4] & (1u << 31)) ||
+                 s->regs[0xc40c / 4]) ? 0 : (1u << 22));
     }
     return stored;
 }
@@ -524,11 +928,14 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
         if (off == 0x8150 && (wen & (1u << 13))) {
             rk_pd_sdmmc_off = data & (1u << 13);
         }
+        if (rk3588_vdec0_power && off == 0x814c && (wen & (1u << 8))) {
+            rk_pd_vdec0_off = data & (1u << 8);
+        }
         if (off == 0x814c && data && (data & wen)) {
             if (data & 0x001) {
                 rk_pd_media_armed |= 1u << 1;   /* gpu (panthor row) */
             }
-            if (data & 0x100) {
+            if (!rk3588_vdec0_power && (data & 0x100)) {
                 rk_pd_media_armed |= 1u << 7;   /* rkvdec0 */
             }
             if (data & 0x200) {
@@ -545,6 +952,10 @@ static void rk_stub_pmu_write(hwaddr off, uint64_t value)
     /* PMU2_MEM_PWR_CON1: hiword write-mask bit 13. */
     if (off == 0x81a4 && (value & (1u << 29))) {
         rk_pd_sdmmc_mem_off = value & (1u << 13);
+    }
+    /* VDEC0 MEM_PWR_CON0 uses the power-control bit, status uses bit 16. */
+    if (rk3588_vdec0_power && off == 0x81a0 && (value & (1u << 24))) {
+        rk_pd_vdec0_mem_off = value & (1u << 8);
     }
 }
 
@@ -625,8 +1036,11 @@ static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
      * iommu@ nodes only pm_runtime_enable() in probe, so the iommu stays
      * available and consumers fail hard rather than defer forever.
      */
-    if (off == 0x8180 || off == 0x81f8) {
+    if (off == 0x8180) {
         return 0;
+    }
+    if (off == 0x81f8) {
+        return rk3588_vdec0_power && rk_pd_vdec0_mem_off ? 1u << 16 : 0;
     }
     if (off == 0x81f0) {
         return 0xffffffffu;
@@ -643,6 +1057,7 @@ static uint64_t rk_stub_pmu_read(uint32_t stored, hwaddr off)
         /* Armed media domains read as OFF (1'b1 = on here).  See the
          * rk_pd_media_armed state comment for the arming rules. */
         return 0xffffffffu & ~rk_pd_media_armed &
+               ~(rk3588_vdec0_power && rk_pd_vdec0_off ? 1u << 7 : 0) &
                ~(rk_pd_sdmmc_off ? 1u << 26 : 0);
     }
     return stored;
@@ -652,6 +1067,43 @@ static uint64_t rk_stub_otp_read(uint32_t stored, hwaddr off)
 {
     if (off == 0x84) {
         stored |= 1u << 1;     /* OTPC_INT_ST: RD_DONE */
+    }
+    return stored;
+}
+
+/* The secure OTP command format is exercised by the ROM at 0xffff0f00.
+ * These fuses are virtual and are not persisted to a host file. */
+static uint64_t rk_stub_secure_otp_read(RkStub *s, uint32_t stored, hwaddr off)
+{
+    if (!rk3588_real_bootrom_mode) {
+        return rk_stub_otp_read(stored, off);
+    }
+    if (off >= 0x20 && off < 0x60) {
+        unsigned addr = (s->regs[0x04 / 4] >> 16) + (off - 0x20) / 4;
+
+        return rk3588_secure_fuses[addr & 0xffff];
+    }
+    return stored;
+}
+
+static uint64_t rk_stub_secure_grf_read(uint32_t stored, hwaddr off)
+{
+    if (rk3588_real_bootrom_mode) {
+        if (off == 0x214) {
+            return rk3588_secure_fuses[1];
+        }
+        if (off == 0x21c) {
+            return rk3588_secure_fuses[0x17];
+        }
+    }
+    return stored;
+}
+
+static uint64_t rk_stub_saradc_read(uint32_t stored, hwaddr off)
+{
+    /* Boot select input high: no recovery button / forced boot mode. */
+    if (rk3588_real_bootrom_mode && off == 0x120) {
+        return 0xfff;
     }
     return stored;
 }
@@ -1155,10 +1607,132 @@ static void rk_stub_write(void *opaque, hwaddr offset, uint64_t value,
     hwaddr aoff = offset & ~(hwaddr)3;
     uint32_t *reg = &s->regs[aoff / 4];
 
+    if (rk3588_real_bootrom_mode &&
+        s->read_hook2 == rk_stub_secure_otp_read && size == 4) {
+        if (aoff == 0x84) {
+            *reg &= ~value;
+            return;
+        }
+        if (aoff == 0x08 && (value & 1)) {
+            uint32_t cmd = s->regs[0x04 / 4];
+            unsigned addr = cmd >> 16;
+
+            if (cmd & 2) {
+                rk3588_secure_fuses[addr] |= s->regs[0x10 / 4];
+                s->regs[0x84 / 4] |= 1u << 3;
+            } else {
+                s->regs[0x84 / 4] |= 1u << 1;
+            }
+        }
+    }
+
     if (s->write_hook) {
         s->write_hook(aoff, value);
     }
 
+    if (s->read_hook2 == rk_stub_dwc3_read2 && size == 4) {
+        if (aoff == 0xc704 && (value & (1u << 30))) {
+            /* Reset the device state currently implemented by this stub.
+             * DCTL itself is excluded from core reset except for CSFTRST. */
+            memset(s->dwc3_ep, 0, sizeof(s->dwc3_ep));
+            memset(&s->regs[0xc800 / 4], 0, 0x100);
+            memset(&s->regs[0xc400 / 4], 0, 0x10);
+            s->dwc3_event_pos = 0;
+            timer_del(s->dwc3_status_timer);
+            s->dwc3_status_events = 0;
+            *reg = value & ~(1u << 30);
+            rk_stub_dwc3_pullup(s, false);
+            rk_stub_dwc3_update_irq(s);
+            return;
+        }
+        if (aoff == 0xc704) {
+            *reg = value;
+            rk_stub_dwc3_pullup(s, value & (1u << 31));
+            return;
+        }
+        if (aoff == 0xc40c) {
+            /* GEVNTCOUNT0 acknowledges bytes, not plain storage. */
+            *reg -= MIN(*reg, (uint32_t)value & 0xfffc);
+            rk_stub_dwc3_update_irq(s);
+            return;
+        }
+        if (aoff == 0xc408) {
+            *reg = value & 0x8000fffcu;
+            rk_stub_dwc3_update_irq(s);
+            return;
+        }
+        if (aoff >= 0xc80c && aoff < 0xc900 &&
+            (aoff & 0xf) == 0xc && (value & 0x400)) {
+            unsigned ep = (aoff - 0xc80c) / 0x10;
+            unsigned cmd = value & 0xf;
+            hwaddr params = aoff - 0xc;
+
+            if (cmd == 9 && ep == 0) {
+                unsigned first = (value >> 16) & 0x7f;
+
+                if (first < ARRAY_SIZE(s->dwc3_ep)) {
+                    memset(&s->dwc3_ep[first], 0,
+                           (ARRAY_SIZE(s->dwc3_ep) - first) *
+                           sizeof(s->dwc3_ep[0]));
+                }
+            } else if (cmd == 1) {
+                for (unsigned i = 0; i < 3; i++) {
+                    s->dwc3_ep[ep].config[i] = s->regs[params / 4 + i];
+                }
+                s->dwc3_ep[ep].configured = true;
+                if (ep >= 2 && s->dwc3_gadget) {
+                    uint32_t cfg = s->dwc3_ep[ep].config[2];
+                    int pid = (ep & 1) ? USB_TOKEN_IN : USB_TOKEN_OUT;
+
+                    usb_ep_set_type(s->dwc3_gadget, pid, ep / 2, (cfg >> 1) & 3);
+                    usb_ep_set_max_packet_size(s->dwc3_gadget, pid, ep / 2,
+                                               (cfg >> 3) & 0x7ff);
+                }
+            } else if (cmd == 2 && s->dwc3_ep[ep].configured) {
+                /* DEPCMDPAR0 is the highest-addressed parameter word. */
+                s->dwc3_ep[ep].resources = s->regs[(params + 8) / 4];
+            } else if ((cmd == 4 || cmd == 5) && s->dwc3_ep[ep].configured) {
+                s->dwc3_ep[ep].stalled = cmd == 4;
+            } else if (cmd == 6 && s->dwc3_ep[ep].configured &&
+                       (s->dwc3_ep[ep].resources & 0xffff) &&
+                       !s->dwc3_ep[ep].transfer_active) {
+                s->dwc3_ep[ep].trb = s->regs[(params + 4) / 4] |
+                    ((uint64_t)s->regs[(params + 8) / 4] << 32);
+                s->dwc3_ep[ep].transfer_active = true;
+                s->dwc3_ep[ep].offset = 0;
+                /* A single transfer resource per endpoint, index 1. */
+                value = (value & ~(0x7fu << 16)) | (1u << 16);
+            } else if (cmd == 8 && s->dwc3_ep[ep].transfer_active &&
+                       ((value >> 16) & 0x7f) == 1) {
+                s->dwc3_ep[ep].transfer_active = false;
+            } else {
+                /* Unsupported or invalid command. */
+                goto store_register;
+            }
+            *reg = value & ~0x400u;
+            if ((value & 0x100) && (s->regs[0xc704 / 4] & (1u << 31))) {
+                rk_stub_dwc3_event(s, (ep << 1) | (7u << 6) | (cmd << 16));
+            }
+            if (cmd == 6 && ep < 2) {
+                rk_stub_dwc3_control_kick(s, ep);
+            }
+            if (cmd == 6 && s->dwc3_gadget && s->dwc3_ep[ep].transfer_active) {
+                int pid = (ep & 1) ? USB_TOKEN_IN : USB_TOKEN_OUT;
+
+                usb_wakeup(usb_ep_get(s->dwc3_gadget, pid, ep / 2), 0);
+            }
+            if (cmd == 4 && ep < 2 && s->dwc3_control_packet) {
+                USBPacket *packet = s->dwc3_control_packet;
+
+                s->dwc3_control_packet = NULL;
+                packet->status = USB_RET_STALL;
+                usb_generic_async_ctrl_complete(s->dwc3_gadget, packet);
+            }
+            return;
+        }
+    }
+
+store_register:
     if (s->track_engine) {
         hwaddr r = aoff & 0xfff;
 
@@ -1222,7 +1796,8 @@ static const RkStubBlock rk_stub_blocks[] = {
      * and the save path's hiword write clears it, as on the part.
      */
     { .name = "grf-sec", .base = 0xfd586000, .size = 0x2000, .hiword = true,
-      .reset_off = 0x1010, .reset_val = 0x10 },
+      .reset_off = 0x1010, .reset_val = 0x10,
+      .read_hook = rk_stub_secure_grf_read },
     /* PMU0_GRF: OS_REG8..11 (0x80-0x8f) are plain RW (TRM ch.6); the TPL
        writes the 0xef08a53c magic to 0x80 and reads it back. */
     MK_MASK("grf-usb",    0xfd588000),
@@ -1330,7 +1905,8 @@ static const RkStubBlock rk_stub_blocks[] = {
     /* RK3588 SARADC (adc@fec10000, u-boot "adc@fec10000" HW-ID channel):
        EDK2's early board detect writes CONV/DAT at +0x00/+0x04; plain
        registers, no hiword write-enables. */
-    { .name = "saradc", .base = 0xfec10000, .size = 0x1000 },
+    { .name = "saradc", .base = 0xfec10000, .size = 0x1000,
+      .read_hook = rk_stub_saradc_read },
 
     /* GPIO (hiword-mask, gen_pin_mask uses pin + 16 mask bits) */
     { .name = "gpio0", .base = 0xfd8a0000, .size = 0x1000, .hiword = true,
@@ -1355,7 +1931,10 @@ static const RkStubBlock rk_stub_blocks[] = {
     /* DDR secure-range GRFs (RMW writes, hiword-mask) */
     MK_MASK("ddrgrf0", 0xfe010000),
     MK_MASK("ddrgrf1", 0xfe030000),
-    MK_MASK("ddrgrf2", 0xfe038000),
+    /* SYSMEM firewall region, master and control registers are plain RW,
+     * not GRF hiword-mask registers (see TF-A rk3588 secure.c).  This is
+     * register storage only; it does not yet enforce DMA access policy. */
+    { .name = "firewall-sysmem", .base = 0xfe038000, .size = 0x1000 },
 
     /* HP "STIMER" (U-Boot CONFIG_ROCKCHIP_STIMER_BASE): the DDR blob's
        cntfrq/timebase setup writes CTRL +0x04, INT_CLR +0x08,
@@ -1517,9 +2096,12 @@ static const RkStubBlock rk_stub_blocks[] = {
     /* Crypto engine (rk_crypto hash path), see rk3588-crypto.c */
     { .name = "crypto", .base = 0xfe370000, .size = 0x8000,
       .read_hook = rk3588_crypto_read, .write_hook = rk3588_crypto_write },
+    { .name = "secure-crypto", .base = 0xfe390000, .size = 0x1000,
+      .read_hook = rk3588_secure_crypto_read,
+      .write_hook = rk3588_secure_crypto_write },
     /* Secure OTP (OTP_S): the SPL reads fuse words here (same protocol) */
     { .name = "secure-otp", .base = 0xfe3a0000, .size = 0x10000,
-      .read_hook = rk_stub_otp_read },
+      .read_hook2 = rk_stub_secure_otp_read },
     /* KEYLADDER_S: see rk_stub_keyladder_read() - unassigned window made
        the vendor BL31 take an EL3 data abort and soft-reset the SoC */
     { .name = "keyladder", .base = 0xfe380000, .size = 0x10000,
@@ -1603,10 +2185,14 @@ static const RkStubBlock rk_stub_blocks[] = {
     { .name = "qos-d", .base = 0xfdf80000, .size = 0x3000 },
 };
 
-void rk3588_create_stub_regions(MemoryRegion *sysmem)
+void rk3588_create_stub_regions(MemoryRegion *sysmem, DeviceState *gic)
 {
     for (int i = 0; i < ARRAY_SIZE(rk_stub_blocks); i++) {
         const RkStubBlock *b = &rk_stub_blocks[i];
+
+        if (rk3588_real_bootrom_mode && b->base == 0xfe2b0000) {
+            continue; /* BootROM mode uses the actual SFC address. */
+        }
         MemoryRegion *mr = g_new(MemoryRegion, 1);
         RkStub *s = g_new0(RkStub, 1);
 
@@ -1624,6 +2210,15 @@ void rk3588_create_stub_regions(MemoryRegion *sysmem)
         s->read_hook = b->read_hook;
         s->read_hook2 = b->read_hook2;
         s->write_hook = b->write_hook;
+        if (b->read_hook2 == rk_stub_dwc3_read2) {
+            s->dwc3_status_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                                rk_stub_dwc3_status_complete, s);
+            s->dwc3_irq = qdev_get_gpio_in(gic, b->base == 0xfc000000 ? 220 : 222);
+            qemu_register_reset(rk_stub_dwc3_reset, s);
+            if (b->base == 0xfc000000) {
+                rk3588_otg_stub = s;
+            }
+        }
         if (b->track_engine) {
             s->tally = g_new0(uint8_t, b->size / 0x10000 + 1);
             memset(s->tally, 1, b->size / 0x10000 + 1);

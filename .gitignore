@@ -49,3 +49,20 @@ opi5-16gb-boot.txt
 # Run logs and Python bytecode
 /qemu-p*.log
 *.pyc
+
+# Relocated local source checkouts, proprietary inputs and build outputs.
+/private/
+/build-local/
+/experiments/atf/
+/experiments/edk2/
+/experiments/rk/
+/experiments/sram-experiments/
+/experiments/tmp-backup/
+/experiments/u-boot/
+/experiments/u-boot-opi5/
+/experiments/initramfs/rootfs/
+/experiments/initramfs/initramfs.cpio.gz
+/experiments/initramfs/initramfs.cpio.list
+/experiments/usb-poc
+/notes/FHS.md
+/futo-bootloader

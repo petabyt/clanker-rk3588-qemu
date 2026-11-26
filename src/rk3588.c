@@ -41,6 +41,8 @@
 #include "target/arm/internals.h"
 #include "dw-apb-uart.h"
 #include "rk3588-spi.h"
+#include "rk3588-sfc.h"
+#include "hw/ssi/ssi.h"
 #include "rk3588-dwmshc.h"
 #include "rk3588-timer.h"
 #include "rk3588-stubs.h"
@@ -49,6 +51,7 @@
 #include "rk3588-edp.h"
 #include "rk3588-vop2.h"
 #include "rk3588-iommu.h"
+#include "rk3588-vdec.h"
 #include "rk3588-sdhci.h"
 #include "rk3588-i2c.h"
 #include "rk3588-i2chid.h"
@@ -169,6 +172,7 @@ static bool rk3588_bl33_explicit;
 static bool rk3588_vgpu;
 /* Raw Mask-ROM-style SRAM payload, not a USB Mask ROM implementation. */
 static bool rk3588_sram_boot;
+static bool rk3588_maskrom_test;
 static uint8_t *rk3588_sram_image;
 static size_t rk3588_sram_image_size;
 /* PCIe link state served by the APB-client LTSSM_STATUS stub (+0x300).
@@ -234,6 +238,19 @@ struct RkBl31Params {           /* v1 (deprecated) bl31_params */
 #define RK3588_SPI_COUNT            480
 
 static struct arm_boot_info rk3588_bootinfo;
+static char *rk3588_bootrom;
+
+static void rk3588_bootrom_reset(void *opaque)
+{
+    CPUState *cs;
+
+    if (!rk3588_bootrom) {
+        return;
+    }
+    CPU_FOREACH(cs) {
+        cpu_set_pc(cs, 0xffff0000);
+    }
+}
 
 /* Set when -bios carries a makeboot --v2 image; drives the P8 reset path. */
 static bool rk3588_bootrom_lite;
@@ -1078,15 +1095,26 @@ static void rk3588_create_usb(DeviceState *gic)
         DeviceState *dev = qdev_new("sysbus-ohci");
         SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+        if (rk3588_sram_boot && ohcis[i].kbd) {
+            dev->id = g_strdup("menu-usb");
+        }
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, ohcis[i].base);
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(gic, ohcis[i].spi));
 
         if (ohcis[i].kbd) {
             DeviceState *kbd = qdev_new("usb-kbd");
+            if (rk3588_sram_boot) {
+                DeviceState *hub = qdev_new("usb-hub");
+
+                qdev_realize_and_unref(hub, qdev_get_child_bus(dev, "menu-usb.0"),
+                                       &error_fatal);
+                qdev_prop_set_string(kbd, "port", "1.1");
+            }
             /* qdev_realize takes the bus itself; set_parent_bus+realize(NULL)
                trips the !parent_bus assertion. */
-            qdev_realize(kbd, qdev_get_child_bus(dev, "usb-bus.0"),
+            qdev_realize(kbd, qdev_get_child_bus(dev, rk3588_sram_boot ?
+                                                "menu-usb.0" : "usb-bus.0"),
                          &error_fatal);
             object_unref(OBJECT(kbd));
         }
@@ -1129,7 +1157,11 @@ static void rk3588_create_display_devices(DeviceState *gic)
         { 0xfdd97e00, 0x100 }, { 0xfdd97f00, 0x100 },
     };
     for (unsigned n = 0; n < ARRAY_SIZE(iommus); n++) {
-        rk3588_create_iommu_window(iommus[n].base, iommus[n].size);
+        RkIommuState *iommu = rk3588_create_iommu_window(iommus[n].base,
+                                                        iommus[n].size);
+        if (rk3588_vdec0_power && iommus[n].base == 0xfdc38700) {
+            rk3588_create_vdec0(gic, iommu);
+        }
     }
 
     dev = qdev_new(TYPE_RK3588_HDMI);
@@ -1277,9 +1309,35 @@ static void rk3588_create_sdmmc(DeviceState *gic)
     if (blk) {
         DeviceState *card = qdev_new(TYPE_SD_CARD);
 
+        if (rk3588_bootrom) {
+            /* A 2.7-3.6V SD card; the ROM compares OCR voltage bits. */
+            qdev_prop_set_uint32(card, "ocr-voltage", 0x00ff8000);
+        }
         qdev_prop_set_drive_err(card, "drive", blk, &error_fatal);
         qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
                                &error_fatal);
+    }
+}
+
+static void rk3588_create_sfc(void)
+{
+    DeviceState *dev = qdev_new(TYPE_RK3588_SFC);
+    DriveInfo *di = drive_get(IF_MTD, 0, 0);
+
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0xfe2b0000);
+    if (di) {
+        DeviceState *flash = qdev_new("xm25qh64c");
+        qemu_irq cs;
+
+        qdev_prop_set_drive_err(flash, "drive", blk_by_legacy_dinfo(di),
+                                &error_fatal);
+        qdev_realize_and_unref(flash, qdev_get_child_bus(dev, "sfc-spi"),
+                               &error_fatal);
+        cs = qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
+        qdev_connect_gpio_out_named(dev, "cs", 0, cs);
+        qemu_set_irq(cs, 1);
+        rk3588_sfc_set_present(dev);
     }
 }
 
@@ -1355,6 +1413,14 @@ static void rk3588_init(MachineState *ms)
     DeviceState *gic;
     int i;
 
+    if (rk3588_bootrom && (ms->firmware || ms->kernel_filename || ms->dtb ||
+                           rk3588_sram_boot || rk3588_maskrom_test)) {
+        error_report("rk3588: bootrom excludes -bios, -kernel, -dtb, "
+                     "sram-boot and maskrom-test");
+        exit(1);
+    }
+    rk3588_real_bootrom_mode = rk3588_bootrom != NULL;
+
     memory_region_init_alias(low_ram, OBJECT(ms), "rk3588.ram-low",
                              ms->ram, 0, low_size);
     memory_region_add_subregion(sysmem, 0, low_ram);
@@ -1397,12 +1463,46 @@ static void rk3588_init(MachineState *ms)
                            RK3588_SRAM1_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, RK3588_SRAM1_BASE, sram1);
 
+    if (rk3588_maskrom_test) {
+        MemoryRegion *rom = g_new(MemoryRegion, 1);
+
+        if (!rk3588_sram_boot) {
+            error_report("rk3588: maskrom-test requires sram-boot=on");
+            exit(1);
+        }
+        /* Test harness may load the ROM dump with the generic loader. */
+        memory_region_init_ram(rom, NULL, "rk3588.maskrom-test", 0x8000,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, 0xffff0000, rom);
+    }
+
+    if (rk3588_bootrom) {
+        MemoryRegion *rom = g_new(MemoryRegion, 1);
+        g_autofree char *contents = NULL;
+        gsize size;
+        g_autoptr(GError) err = NULL;
+
+        if (!g_file_get_contents(rk3588_bootrom, &contents, &size, &err)) {
+            error_report("rk3588: cannot read bootrom '%s': %s",
+                         rk3588_bootrom, err->message);
+            exit(1);
+        }
+        if (size != 0x8000) {
+            error_report("rk3588: bootrom must be exactly 32768 bytes");
+            exit(1);
+        }
+        memory_region_init_rom(rom, NULL, "rk3588.bootrom", size,
+                               &error_fatal);
+        memcpy(memory_region_get_ram_ptr(rom), contents, size);
+        memory_region_add_subregion(sysmem, 0xffff0000, rom);
+    }
+
     if (rk3588_sram_boot && (!ms->firmware || ms->kernel_filename || ms->dtb)) {
         error_report("rk3588: sram-boot requires -bios and excludes -kernel/-dtb");
         exit(1);
     }
     rk3588_load_firmware(ms, low_size);
-    if (!rk3588_sram_boot) {
+    if (!rk3588_sram_boot && !rk3588_bootrom) {
         rk3588_parse_v2_header(ms);
     }
     if (rk3588_bootrom_lite) {
@@ -1435,7 +1535,7 @@ static void rk3588_init(MachineState *ms)
                                 &error_abort);
         object_property_set_int(cpuobj, "mp-affinity", affinity, &error_abort);
         object_property_set_bool(cpuobj, "has_el3", true, &error_abort);
-        if (i > 0) {
+        if (i > 0 && !rk3588_bootrom) {
             /*
              * The bootrom parks secondary cores in an EL3 WFE loop at
              * 0xffff00e0 (see arm-docs/rk3588_bootrom.c); QEMU has no
@@ -1463,7 +1563,10 @@ static void rk3588_init(MachineState *ms)
     if (rk3588_vgpu) {
         rk3588_create_virtio_gpu(gic);
     }
-    rk3588_create_stub_regions(get_system_memory());
+    rk3588_create_stub_regions(get_system_memory(), gic);
+    if (rk3588_bootrom) {
+        rk3588_create_sfc();
+    }
     if (rk3588_pcie_experimental) {
         DeviceState *pcie = qdev_new(TYPE_DESIGNWARE_PCIE_HOST);
         SysBusDevice *sbd = SYS_BUS_DEVICE(pcie);
@@ -1537,6 +1640,7 @@ static void rk3588_init(MachineState *ms)
     /* SMP: forget which secondaries were woken (A3); do_cpu_reset has
      * already re-parked the start-powered-off CPUs. */
     qemu_register_reset(rk3588_smp_reset, NULL);
+    qemu_register_reset(rk3588_bootrom_reset, NULL);
 }
 
 static void rk3588_machine_init(MachineClass *mc)
@@ -1598,6 +1702,31 @@ static void rk3588_set_sram_boot(Object *obj, Visitor *v, const char *name,
     visit_type_bool(v, name, &rk3588_sram_boot, errp);
 }
 
+static void rk3588_get_maskrom_test(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    bool val = rk3588_maskrom_test;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_maskrom_test(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_maskrom_test, errp);
+}
+
+static char *rk3588_get_bootrom(Object *obj, Error **errp)
+{
+    return g_strdup(rk3588_bootrom);
+}
+
+static void rk3588_set_bootrom(Object *obj, const char *value, Error **errp)
+{
+    g_free(rk3588_bootrom);
+    rk3588_bootrom = g_strdup(value);
+}
+
 static void rk3588_set_vgpu(Object *obj, Visitor *v, const char *name,
                             void *opaque, Error **errp)
 {
@@ -1616,6 +1745,20 @@ static void rk3588_set_pcie_link(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
 {
     visit_type_bool(v, name, &rk3588_pcie_link_up, errp);
+}
+
+static void rk3588_get_vdec0_power(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    bool val = rk3588_vdec0_power;
+
+    visit_type_bool(v, name, &val, errp);
+}
+
+static void rk3588_set_vdec0_power(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    visit_type_bool(v, name, &rk3588_vdec0_power, errp);
 }
 
 static void rk3588_get_pcie_its(Object *obj, Visitor *v, const char *name,
@@ -1668,11 +1811,22 @@ static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
+    object_class_property_add_str(oc, "bootrom", rk3588_get_bootrom,
+                                  rk3588_set_bootrom);
+    object_class_property_set_description(oc, "bootrom",
+        "Execute a 32 KiB RK3588 BootROM image (experimental)");
+
     object_class_property_add(oc, "sram-boot", "boolean",
                               rk3588_get_sram_boot, rk3588_set_sram_boot,
                               NULL, NULL);
     object_class_property_set_description(oc, "sram-boot",
         "Load raw -bios as a pre-DDR SRAM first stage (not USB Mask ROM)");
+
+    object_class_property_add(oc, "maskrom-test", "boolean",
+                              rk3588_get_maskrom_test, rk3588_set_maskrom_test,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "maskrom-test",
+        "Map writable BootROM test memory at 0xffff0000 (requires sram-boot)");
 
     object_class_property_add(oc, "bl33-base", "uint64",
                               rk3588_get_bl33_base, rk3588_set_bl33_base,
@@ -1691,6 +1845,11 @@ static void rk3588_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add(oc, "pcie-link", "boolean",
                               rk3588_get_pcie_link, rk3588_set_pcie_link,
                               NULL, NULL);
+    object_class_property_add(oc, "vdec0-power", "boolean",
+                              rk3588_get_vdec0_power, rk3588_set_vdec0_power,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "vdec0-power",
+        "Experimental VDEC0 power and restricted host-backed H.264 decode");
     object_class_property_set_description(oc, "pcie-link",
                                           "Report PCIe link-up in the APB "
                                           "LTSSM_STATUS stub (default on for "

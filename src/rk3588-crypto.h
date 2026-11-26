@@ -11,9 +11,11 @@
  * the digest words from 0x3a0.. once +0x3e4 reads nonzero.
  *
  * Hooks have the RkStubReadHook/RkStubWriteHook signatures used by
- * rk3588-stubs.c. Single instance, so state is file-static.
+ * rk3588-stubs.c. Secure and non-secure engines have separate state.
  */
 uint64_t rk3588_crypto_read(uint32_t stored, hwaddr off);
 void rk3588_crypto_write(hwaddr off, uint64_t value);
+uint64_t rk3588_secure_crypto_read(uint32_t stored, hwaddr off);
+void rk3588_secure_crypto_write(hwaddr off, uint64_t value);
 
 #endif
